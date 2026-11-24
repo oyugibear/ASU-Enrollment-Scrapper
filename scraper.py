@@ -2,11 +2,10 @@ import asyncio
 import json
 import os
 import random
-import re
 import time
 
+from collections import defaultdict
 from datetime import datetime
-from itertools import islice
 
 import google.auth
 import gspread
@@ -23,27 +22,16 @@ from playwright.async_api import (
 # CONFIGURATION
 # ============================================================
 
-CONCURRENCY = 2
-
-ASU_MAX_ATTEMPTS = 3
-
 GOOGLE_MAX_ATTEMPTS = 6
 
-BATCH_DELAY_MIN = 1.5
-BATCH_DELAY_MAX = 3.0
+COURSE_MAX_ATTEMPTS = 3
 
+COURSE_RESPONSE_TIMEOUT = 35
 
-TRANSIENT_ERROR_TYPES = {
-    "PAGE_TIMEOUT",
-    "ENROLLMENT_DATA_TIMEOUT",
-    "NO_RESPONSE",
-    "TIMEOUT",
-    "HTTP_429",
-    "HTTP_500",
-    "HTTP_502",
-    "HTTP_503",
-    "HTTP_504",
-}
+PAGE_NAVIGATION_TIMEOUT = 60000
+
+COURSE_DELAY_MIN = 0.75
+COURSE_DELAY_MAX = 1.75
 
 
 # ============================================================
@@ -64,7 +52,10 @@ TRANSIENT_ERROR_TYPES = {
 # M = Enroll Desc
 # ============================================================
 
+COL_SUBJECT = 0
+COL_CATALOG_NUM = 1
 COL_CLASS_NUM = 2
+COL_TITLE = 3
 
 COL_INSTRUCTOR_LAST = 4
 COL_INSTRUCTOR_FIRST = 5
@@ -111,12 +102,12 @@ def get_google_credentials():
                 raw_json
             )
 
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError as error:
 
             raise RuntimeError(
                 "GOOGLE_SERVICE_ACCOUNT_JSON "
                 "contains invalid JSON."
-            ) from e
+            ) from error
 
         credentials = (
             service_account
@@ -140,7 +131,7 @@ def get_google_credentials():
         return credentials
 
     # --------------------------------------------------------
-    # GOOGLE CLOUD / CLOUD SHELL FALLBACK
+    # GOOGLE CLOUD / LOCAL ADC FALLBACK
     # --------------------------------------------------------
 
     credentials, project = (
@@ -224,20 +215,24 @@ def google_retry(
 
             return operation()
 
-        except Exception as e:
+        except Exception as error:
 
-            last_error = e
+            last_error = error
 
             if not is_retryable_google_error(
-                e
+                error
             ):
+
                 raise
 
             if attempt >= attempts:
+
                 break
 
             delay = min(
-                2 ** (attempt - 1),
+                2 ** (
+                    attempt - 1
+                ),
                 30,
             )
 
@@ -247,10 +242,11 @@ def google_retry(
             )
 
             print(
-                f"{description} failed "
-                f"with temporary Google error. "
-                f"Attempt {attempt}/{attempts}. "
-                f"Retrying in {delay:.1f}s..."
+                f"{description} failed. "
+                f"Attempt "
+                f"{attempt}/{attempts}. "
+                f"Retrying in "
+                f"{delay:.1f}s..."
             )
 
             time.sleep(
@@ -261,7 +257,7 @@ def google_retry(
 
 
 # ============================================================
-# GOOGLE SHEET
+# OPEN GOOGLE SHEET
 # ============================================================
 
 def get_sheet(
@@ -307,7 +303,7 @@ def get_sheet(
 
 
 # ============================================================
-# DATE PARSING
+# DATE HELPERS
 # ============================================================
 
 def parse_sheet_date(
@@ -329,7 +325,7 @@ def parse_sheet_date(
 
 
 # ============================================================
-# FIND PREVIOUS DATED ENROLLMENT RUN
+# FIND PREVIOUS DAILY ENROLLMENT SHEET
 # ============================================================
 
 def get_previous_run_sheet(
@@ -347,7 +343,8 @@ def get_previous_run_sheet(
 
         print(
             "Could not parse current "
-            f"sheet name: {current_sheet_name}"
+            f"sheet name: "
+            f"{current_sheet_name}"
         )
 
         return None
@@ -366,19 +363,19 @@ def get_previous_run_sheet(
             worksheet.title
         )
 
-        # Ignore system sheets.
         if name in [
             "Enrollment Home",
             "Enrollment Template",
             "Enrollment Jobs",
         ]:
+
             continue
 
-        # Ignore today's sheet.
         if (
             name ==
             current_sheet_name
         ):
+
             continue
 
         sheet_date = (
@@ -388,7 +385,8 @@ def get_previous_run_sheet(
         )
 
         if (
-            sheet_date and
+            sheet_date
+            and
             sheet_date <
             current_date
         ):
@@ -430,16 +428,11 @@ def get_previous_run_sheet(
 # ============================================================
 # PREVIOUS DAY LOOKUP
 #
-# IMPORTANT:
+# TODAY G Previous Amount
+# = PREVIOUS DAY J Current
 #
-# Today's G Previous Amount
-#     = previous day's J Current
-#
-# Today's L Previous enrollment capacity
-#     = previous day's H Enroll Cap
-#
-# We intentionally DO NOT carry forward yesterday's
-# G or L historical fields.
+# TODAY L Previous enrollment capacity
+# = PREVIOUS DAY H Enroll Cap
 # ============================================================
 
 def build_previous_lookup(
@@ -450,7 +443,7 @@ def build_previous_lookup(
 
         print(
             "No previous enrollment run. "
-            "Previous values will remain blank."
+            "Historical values will remain blank."
         )
 
         return {}
@@ -470,6 +463,7 @@ def build_previous_lookup(
             len(row) <=
             COL_CLASS_NUM
         ):
+
             continue
 
         class_num = str(
@@ -479,11 +473,8 @@ def build_previous_lookup(
         ).strip()
 
         if not class_num:
-            continue
 
-        # ----------------------------------------------------
-        # PREVIOUS DAY ACTUAL VALUES
-        # ----------------------------------------------------
+            continue
 
         previous_current = (
             row[
@@ -512,7 +503,7 @@ def build_previous_lookup(
             else ""
         )
 
-        previous_last_name = (
+        previous_last = (
             row[
                 COL_INSTRUCTOR_LAST
             ]
@@ -521,7 +512,7 @@ def build_previous_lookup(
             else ""
         )
 
-        previous_first_name = (
+        previous_first = (
             row[
                 COL_INSTRUCTOR_FIRST
             ]
@@ -535,29 +526,43 @@ def build_previous_lookup(
         ] = {
 
             "last_name":
-                previous_last_name,
+                str(
+                    previous_last
+                ).strip(),
 
             "first_name":
-                previous_first_name,
+                str(
+                    previous_first
+                ).strip(),
 
-            # Previous day's actual enrollment.
+            # Yesterday Current
+            # -> Today Previous Amount
             "previous_amount":
-                previous_current,
+                str(
+                    previous_current
+                ).strip(),
 
-            # Previous day's actual capacity.
+            # Yesterday Enroll Cap
+            # -> Today Previous enrollment capacity
             "previous_capacity":
-                previous_cap,
+                str(
+                    previous_cap
+                ).strip(),
 
-            # Retain actual previous values for
-            # changed/unchanged comparisons.
             "cap":
-                previous_cap,
+                str(
+                    previous_cap
+                ).strip(),
 
             "open":
-                previous_open,
+                str(
+                    previous_open
+                ).strip(),
 
             "current":
-                previous_current,
+                str(
+                    previous_current
+                ).strip(),
         }
 
     print(
@@ -570,10 +575,10 @@ def build_previous_lookup(
 
 
 # ============================================================
-# CURRENT DAILY ROW LOOKUP
+# CURRENT EA LOOKUPS
 # ============================================================
 
-def build_daily_row_lookup(
+def build_daily_lookup(
     all_values,
 ):
 
@@ -588,579 +593,146 @@ def build_daily_row_lookup(
             len(row) <=
             COL_CLASS_NUM
         ):
+
             continue
 
-        class_num = str(
-            row[
-                COL_CLASS_NUM
-            ]
-        ).strip()
+        subject = (
+            str(
+                row[
+                    COL_SUBJECT
+                ]
+            ).strip()
+            if len(row) >
+            COL_SUBJECT
+            else ""
+        )
+
+        catalog_num = (
+            str(
+                row[
+                    COL_CATALOG_NUM
+                ]
+            ).strip()
+            if len(row) >
+            COL_CATALOG_NUM
+            else ""
+        )
+
+        class_num = (
+            str(
+                row[
+                    COL_CLASS_NUM
+                ]
+            ).strip()
+        )
 
         if not class_num:
+
             continue
 
-        # Keep first occurrence.
-        if (
-            class_num not in
-            lookup
-        ):
+        # Keep the first occurrence of a Class Num.
+        if class_num in lookup:
 
-            lookup[
-                class_num
-            ] = {
-                "row_number":
-                    row_number,
+            print(
+                f"{class_num}: "
+                "duplicate Class Num in EA; "
+                "using first occurrence."
+            )
 
-                "row":
-                    row,
-            }
+            continue
+
+        lookup[
+            class_num
+        ] = {
+
+            "row_number":
+                row_number,
+
+            "row":
+                row,
+
+            "subject":
+                subject.upper(),
+
+            "catalog_num":
+                catalog_num,
+        }
 
     return lookup
 
 
 # ============================================================
-# RESULT HELPERS
+# BUILD COURSE GROUPS
+#
+# Example:
+#
+# {
+#   ("PHY", "111"): {"65830", "61059", ...},
+#   ("PHY", "113"): {...},
+#   ("PHS", "110"): {...}
+# }
 # ============================================================
 
-def scraper_error(
-    class_num,
-    error_type,
-    error,
+def build_course_groups(
+    daily_lookup,
 ):
 
-    return {
-        "class_num":
-            str(
-                class_num
-            ),
-
-        "status":
-            "ERROR",
-
-        "error_type":
-            error_type,
-
-        "error":
-            str(
-                error
-            ),
-    }
-
-
-def scraper_no_data(
-    class_num,
-    error_type,
-    error,
-):
-
-    return {
-        "class_num":
-            str(
-                class_num
-            ),
-
-        "status":
-            "NO_DATA",
-
-        "error_type":
-            error_type,
-
-        "error":
-            str(
-                error
-            ),
-    }
-
-
-def is_transient_result(
-    result,
-):
-
-    if (
-        result.get(
-            "status"
-        ) != "ERROR"
-    ):
-        return False
-
-    error_type = str(
-        result.get(
-            "error_type",
-            "",
-        )
-    ).upper()
-
-    return (
-        error_type
-        in TRANSIENT_ERROR_TYPES
+    groups = defaultdict(
+        set
     )
 
+    invalid_classes = []
 
-# ============================================================
-# SCRAPE ONE CLASS
-# ============================================================
+    for (
+        class_num,
+        info,
+    ) in daily_lookup.items():
 
-async def scrape_class_once(
-    context,
-    class_num,
-    term,
-):
-
-    page = (
-        await context.new_page()
-    )
-
-    class_num = str(
-        class_num
-    ).strip()
-
-    url = (
-        "https://catalog.apps.asu.edu/"
-        "catalog/classes/classlist?"
-        "advanced=true"
-        "&campusOrOnlineSelection=A"
-        f"&classNbr={class_num}"
-        "&honors=F"
-        "&promod=F"
-        "&searchType=all"
-        f"&term={term}"
-    )
-
-    print(
-        f"Visiting: {url}"
-    )
-
-    try:
-
-        # ----------------------------------------------------
-        # LOAD ASU PAGE
-        # ----------------------------------------------------
-
-        try:
-
-            response = (
-                await page.goto(
-                    url,
-                    timeout=30000,
-                    wait_until="load",
-                )
+        subject = str(
+            info.get(
+                "subject",
+                "",
             )
+        ).strip().upper()
 
-        except PlaywrightTimeoutError:
-
-            return scraper_error(
-                class_num,
-                "PAGE_TIMEOUT",
-                (
-                    "ASU page did not "
-                    "finish loading within "
-                    "30 seconds."
-                ),
+        catalog_num = str(
+            info.get(
+                "catalog_num",
+                "",
             )
-
-        # ----------------------------------------------------
-        # HTTP RESPONSE
-        # ----------------------------------------------------
-
-        if response:
-
-            status_code = (
-                response.status
-            )
-
-            if (
-                status_code ==
-                429
-            ):
-
-                return scraper_error(
-                    class_num,
-                    "HTTP_429",
-                    (
-                        "ASU returned HTTP 429 "
-                        "Too Many Requests."
-                    ),
-                )
-
-            if status_code in [
-                500,
-                502,
-                503,
-                504,
-            ]:
-
-                return scraper_error(
-                    class_num,
-                    f"HTTP_{status_code}",
-                    (
-                        "ASU returned temporary "
-                        f"HTTP {status_code}."
-                    ),
-                )
-
-        # ----------------------------------------------------
-        # WAIT FOR ENROLLMENT DATA
-        # ----------------------------------------------------
-
-        try:
-
-            await page.wait_for_selector(
-                "text=Open Seats",
-                timeout=35000,
-            )
-
-        except PlaywrightTimeoutError:
-
-            try:
-
-                body_text = (
-                    await page
-                    .locator(
-                        "body"
-                    )
-                    .inner_text()
-                )
-
-                body_text = re.sub(
-                    r"\s+",
-                    " ",
-                    body_text,
-                ).strip()
-
-            except Exception:
-
-                body_text = ""
-
-            if not body_text:
-
-                return scraper_error(
-                    class_num,
-                    "NO_RESPONSE",
-                    (
-                        "ASU returned no "
-                        "usable page content."
-                    ),
-                )
-
-            not_found_patterns = [
-                "No classes found",
-                "No results found",
-                "No classes match",
-                "There are no classes",
-            ]
-
-            not_found = any(
-                pattern.lower()
-                in body_text.lower()
-                for pattern
-                in not_found_patterns
-            )
-
-            if not_found:
-
-                return scraper_no_data(
-                    class_num,
-                    "CLASS_NOT_FOUND",
-                    (
-                        "ASU did not return "
-                        "a matching class."
-                    ),
-                )
-
-            return scraper_error(
-                class_num,
-                "ENROLLMENT_DATA_TIMEOUT",
-                (
-                    "ASU page loaded, but "
-                    "enrollment data was not "
-                    "available within 35 seconds."
-                ),
-            )
-
-        # ----------------------------------------------------
-        # PAGE TEXT
-        # ----------------------------------------------------
-
-        text_content = (
-            await page
-            .locator(
-                "body"
-            )
-            .inner_text()
-        )
-
-        text_content = re.sub(
-            r"\s+",
-            " ",
-            text_content,
         ).strip()
 
-        # ----------------------------------------------------
-        # INSTRUCTOR
-        # ----------------------------------------------------
-
-        instructor_match = re.search(
-            rf"{re.escape(class_num)}\s+"
-            r"([A-Z][a-z]+"
-            r"(?:\s[A-Z][a-z]+)*)",
-            text_content,
-        )
-
-        instructor = (
-            instructor_match
-            .group(1)
-            .strip()
-            if instructor_match
-            else "TBA"
-        )
-
-        # ----------------------------------------------------
-        # ENROLLMENT
-        # ----------------------------------------------------
-
-        seats_matches = re.findall(
-            r"(\d+)\s+of\s+(\d+)",
-            text_content,
-        )
-
-        if not seats_matches:
-
-            return scraper_no_data(
-                class_num,
-                "NO_ENROLLMENT_DATA",
-                (
-                    "Class page was found, "
-                    "but enrollment values "
-                    "were not found."
-                ),
-            )
-
-        open_seats, enroll_cap = (
-            seats_matches[-1]
-        )
-
-        current = (
-            int(
-                enroll_cap
-            )
-            -
-            int(
-                open_seats
-            )
-        )
-
-        print(
-            f"SUCCESS {class_num}: "
-            f"{instructor}, "
-            f"Cap={enroll_cap}, "
-            f"Open={open_seats}, "
-            f"Current={current}"
-        )
-
-        return {
-            "class_num":
-                class_num,
-
-            "status":
-                "SUCCESS",
-
-            "instructor":
-                instructor,
-
-            "cap":
-                str(
-                    enroll_cap
-                ),
-
-            "open":
-                str(
-                    open_seats
-                ),
-
-            "current":
-                str(
-                    current
-                ),
-
-            "error_type":
-                None,
-
-            "error":
-                None,
-        }
-
-    except PlaywrightTimeoutError as e:
-
-        print(
-            f"TIMEOUT {class_num}: "
-            f"{e}"
-        )
-
-        return scraper_error(
-            class_num,
-            "TIMEOUT",
-            str(
-                e
-            ),
-        )
-
-    except Exception as e:
-
-        print(
-            f"ERROR {class_num}: "
-            f"{type(e).__name__}: "
-            f"{e}"
-        )
-
-        return scraper_error(
-            class_num,
-            type(e).__name__,
-            str(
-                e
-            ),
-        )
-
-    finally:
-
-        try:
-
-            await page.close()
-
-        except Exception:
-
-            pass
-
-
-# ============================================================
-# SCRAPE WITH RETRIES
-# ============================================================
-
-async def scrape_class(
-    context,
-    class_num,
-    term,
-    max_attempts=ASU_MAX_ATTEMPTS,
-):
-
-    last_result = None
-
-    for attempt in range(
-        1,
-        max_attempts + 1,
-    ):
-
-        result = (
-            await scrape_class_once(
-                context,
-                class_num,
-                term,
-            )
-        )
-
-        last_result = (
-            result
-        )
-
-        # Success and confirmed no-data do not retry.
         if (
-            result.get(
-                "status"
+            not subject
+            or
+            not catalog_num
+        ):
+
+            invalid_classes.append(
+                class_num
             )
-            in [
-                "SUCCESS",
-                "NO_DATA",
-            ]
-        ):
 
-            return result
+            continue
 
-        if not is_transient_result(
-            result
-        ):
-
-            return result
-
-        if (
-            attempt >=
-            max_attempts
-        ):
-
-            break
-
-        delay = min(
-            2 ** (
-                attempt - 1
-            ),
-            8,
-        )
-
-        delay += random.uniform(
-            0.5,
-            1.5,
-        )
-
-        print(
-            f"{class_num}: temporary "
-            f"{result.get('error_type')} "
-            f"on attempt "
-            f"{attempt}/{max_attempts}. "
-            f"Retrying in "
-            f"{delay:.1f}s..."
-        )
-
-        await asyncio.sleep(
-            delay
-        )
-
-    return last_result
-
-
-# ============================================================
-# INSTRUCTOR
-# ============================================================
-
-def split_instructor(
-    instructor,
-):
-
-    if not instructor:
-
-        return "", ""
-
-    if instructor.lower() in [
-        "tba",
-        "staff",
-    ]:
-
-        return "", ""
-
-    parts = (
-        instructor.split()
-    )
-
-    if len(parts) >= 2:
-
-        first_name = (
-            parts[0]
-        )
-
-        last_name = " ".join(
-            parts[1:]
-        )
-
-        return (
-            last_name,
-            first_name,
+        groups[
+            (
+                subject,
+                catalog_num,
+            )
+        ].add(
+            class_num
         )
 
     return (
-        "",
-        instructor,
+        dict(
+            groups
+        ),
+        invalid_classes,
     )
 
 
 # ============================================================
-# DIFFERENCE
+# INTEGER / DIFFERENCE
 # ============================================================
 
 def calculate_difference(
@@ -1180,9 +752,9 @@ def calculate_difference(
         else ""
     ).strip()
 
-    # No historical observation.
     if (
-        current_text == "" or
+        current_text == ""
+        or
         previous_text == ""
     ):
 
@@ -1250,534 +822,1243 @@ def build_enrollment_description(
 
 
 # ============================================================
-# PROCESS + WRITE ONE BATCH
+# EXTRACT INSTRUCTOR
 # ============================================================
 
-def update_batch(
-    sheet,
-    batch_results,
-    previous_lookup,
+def extract_instructor(
+    clas,
+):
+
+    first_names = (
+        clas.get(
+            "INSTRUCTORSFIRSTNAMESHOWALL"
+        )
+        or
+        clas.get(
+            "INSTRUCTORSFIRSTNAMELIST"
+        )
+        or
+        []
+    )
+
+    last_names = (
+        clas.get(
+            "INSTRUCTORSLASTNAMESHOWALL"
+        )
+        or
+        clas.get(
+            "INSTRUCTORSLASTNAMELIST"
+        )
+        or
+        []
+    )
+
+    first_name = ""
+    last_name = ""
+
+    if first_names:
+
+        first_name = str(
+            first_names[0]
+        ).split(
+            "~"
+        )[0].strip()
+
+    if last_names:
+
+        last_name = str(
+            last_names[0]
+        ).split(
+            "~"
+        )[0].strip()
+
+    # ASU sometimes returns Staff.
+    if (
+        first_name.lower() ==
+        "staff"
+    ):
+
+        first_name = ""
+
+    if (
+        last_name.lower() ==
+        "staff"
+    ):
+
+        last_name = ""
+
+    return (
+        last_name,
+        first_name,
+    )
+
+
+# ============================================================
+# SIMPLIFY ONE ASU CLASS OBJECT
+# ============================================================
+
+def simplify_asu_class(
+    item,
+):
+
+    if not isinstance(
+        item,
+        dict,
+    ):
+
+        return None
+
+    clas = (
+        item.get(
+            "CLAS",
+            {}
+        )
+    )
+
+    if not isinstance(
+        clas,
+        dict,
+    ):
+
+        return None
+
+    class_num = str(
+        clas.get(
+            "CLASSNBR",
+            "",
+        )
+    ).strip()
+
+    if not class_num:
+
+        return None
+
+    seat_info = (
+        item.get(
+            "seatInfo",
+            {}
+        )
+    )
+
+    if not isinstance(
+        seat_info,
+        dict,
+    ):
+
+        seat_info = {}
+
+    # --------------------------------------------------------
+    # CAPACITY
+    # --------------------------------------------------------
+
+    enroll_cap = (
+        seat_info.get(
+            "ENRL_CAP"
+        )
+    )
+
+    if enroll_cap is None:
+
+        enroll_cap = (
+            clas.get(
+                "ENRLCAP"
+            )
+        )
+
+    # --------------------------------------------------------
+    # CURRENT ENROLLMENT
+    # --------------------------------------------------------
+
+    enroll_total = (
+        seat_info.get(
+            "ENRL_TOT"
+        )
+    )
+
+    if enroll_total is None:
+
+        enroll_total = (
+            clas.get(
+                "ENRLTOT"
+            )
+        )
+
+    # --------------------------------------------------------
+    # OPEN SEATS
+    # --------------------------------------------------------
+
+    open_seats = None
+
+    try:
+
+        if (
+            enroll_cap is not None
+            and
+            enroll_total is not None
+        ):
+
+            open_seats = (
+                int(
+                    enroll_cap
+                )
+                -
+                int(
+                    enroll_total
+                )
+            )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        open_seats = None
+
+    # --------------------------------------------------------
+    # INSTRUCTOR
+    # --------------------------------------------------------
+
+    (
+        instructor_last,
+        instructor_first,
+    ) = extract_instructor(
+        clas
+    )
+
+    return {
+
+        "class_num":
+            class_num,
+
+        "subject":
+            str(
+                clas.get(
+                    "SUBJECT",
+                    "",
+                )
+            ).strip(),
+
+        "catalog_num":
+            str(
+                clas.get(
+                    "CATALOGNBR",
+                    "",
+                )
+            ).strip(),
+
+        "section":
+            str(
+                clas.get(
+                    "CLASSSECTION",
+                    "",
+                )
+            ).strip(),
+
+        "session":
+            str(
+                clas.get(
+                    "SESSIONCODE",
+                    "",
+                )
+            ).strip(),
+
+        "component":
+            str(
+                clas.get(
+                    "SSRCOMPONENT",
+                    "",
+                )
+            ).strip(),
+
+        "title":
+            str(
+                clas.get(
+                    "TITLE",
+                    "",
+                )
+            ).strip(),
+
+        "instructor_last":
+            instructor_last,
+
+        "instructor_first":
+            instructor_first,
+
+        "cap":
+            (
+                ""
+                if enroll_cap is None
+                else str(
+                    enroll_cap
+                )
+            ),
+
+        "current":
+            (
+                ""
+                if enroll_total is None
+                else str(
+                    enroll_total
+                )
+            ),
+
+        "open":
+            (
+                ""
+                if open_seats is None
+                else str(
+                    open_seats
+                )
+            ),
+    }
+
+
+# ============================================================
+# COURSE SEARCH URL
+# ============================================================
+
+def build_course_search_url(
+    subject,
+    catalog_num,
+    term,
+):
+
+    return (
+        "https://catalog.apps.asu.edu/"
+        "catalog/classes/classlist?"
+        "advanced=true"
+        "&campusOrOnlineSelection=A"
+        f"&catalogNbr={catalog_num}"
+        "&honors=F"
+        "&promod=F"
+        "&searchType=all"
+        f"&subject={subject}"
+        f"&term={term}"
+    )
+
+
+# ============================================================
+# INDIVIDUAL FALLBACK URL
+# ============================================================
+
+def build_class_search_url(
+    class_num,
+    term,
+):
+
+    return (
+        "https://catalog.apps.asu.edu/"
+        "catalog/classes/classlist?"
+        "advanced=true"
+        "&campusOrOnlineSelection=A"
+        f"&classNbr={class_num}"
+        "&honors=F"
+        "&promod=F"
+        "&searchType=all"
+        f"&term={term}"
+    )
+
+
+# ============================================================
+# WAIT FOR ASU'S OWN /search/classes RESPONSE
+#
+# IMPORTANT:
+#
+# We do NOT call the ASU API ourselves.
+#
+# The ASU Class Search frontend makes its own authenticated
+# /search/classes request. We intercept that response.
+# ============================================================
+
+async def capture_search_response(
+    page,
+    navigation_url,
+    matcher,
+):
+
+    loop = (
+        asyncio.get_running_loop()
+    )
+
+    response_future = (
+        loop.create_future()
+    )
+
+    async def handle_response(
+        response,
+    ):
+
+        if response_future.done():
+
+            return
+
+        url = (
+            response.url
+        )
+
+        if (
+            "/search/classes"
+            not in url
+        ):
+
+            return
+
+        if not matcher(
+            url
+        ):
+
+            return
+
+        try:
+
+            if (
+                response.status !=
+                200
+            ):
+
+                response_future.set_result({
+                    "ok":
+                        False,
+
+                    "status":
+                        response.status,
+
+                    "url":
+                        url,
+
+                    "error":
+                        (
+                            "ASU classes API "
+                            f"returned HTTP "
+                            f"{response.status}."
+                        ),
+                })
+
+                return
+
+            data = (
+                await response.json()
+            )
+
+            response_future.set_result({
+                "ok":
+                    True,
+
+                "status":
+                    response.status,
+
+                "url":
+                    url,
+
+                "data":
+                    data,
+            })
+
+        except Exception as error:
+
+            if not response_future.done():
+
+                response_future.set_result({
+                    "ok":
+                        False,
+
+                    "status":
+                        response.status,
+
+                    "url":
+                        url,
+
+                    "error":
+                        (
+                            f"{type(error).__name__}: "
+                            f"{error}"
+                        ),
+                })
+
+    page.on(
+        "response",
+        handle_response,
+    )
+
+    try:
+
+        try:
+
+            await page.goto(
+                navigation_url,
+                timeout=
+                    PAGE_NAVIGATION_TIMEOUT,
+                wait_until=
+                    "domcontentloaded",
+            )
+
+        except PlaywrightTimeoutError:
+
+            # The API response may still arrive even when
+            # the full page navigation exceeds the timeout.
+            print(
+                "Page navigation timed out; "
+                "continuing to wait for "
+                "ASU classes API response."
+            )
+
+        try:
+
+            result = (
+                await asyncio.wait_for(
+                    response_future,
+                    timeout=
+                        COURSE_RESPONSE_TIMEOUT,
+                )
+            )
+
+            return result
+
+        except asyncio.TimeoutError:
+
+            return {
+                "ok":
+                    False,
+
+                "status":
+                    0,
+
+                "url":
+                    navigation_url,
+
+                "error":
+                    (
+                        "Timed out waiting for "
+                        "ASU /search/classes response."
+                    ),
+            }
+
+    finally:
+
+        try:
+
+            page.remove_listener(
+                "response",
+                handle_response,
+            )
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# SCRAPE ONE COURSE
+# ============================================================
+
+async def scrape_course_once(
+    page,
+    subject,
+    catalog_num,
+    term,
+):
+
+    navigation_url = (
+        build_course_search_url(
+            subject,
+            catalog_num,
+            term,
+        )
+    )
+
+    subject_marker = (
+        f"subject={subject}"
+    )
+
+    catalog_marker = (
+        f"catalogNbr={catalog_num}"
+    )
+
+    term_marker = (
+        f"term={term}"
+    )
+
+    def matcher(
+        url,
+    ):
+
+        return (
+            subject_marker in url
+            and
+            catalog_marker in url
+            and
+            term_marker in url
+        )
+
+    result = (
+        await capture_search_response(
+            page,
+            navigation_url,
+            matcher,
+        )
+    )
+
+    if not result.get(
+        "ok"
+    ):
+
+        return {
+            "status":
+                "ERROR",
+
+            "subject":
+                subject,
+
+            "catalog_num":
+                catalog_num,
+
+            "error_type":
+                (
+                    "HTTP_ERROR"
+                    if result.get(
+                        "status"
+                    )
+                    else
+                    "COURSE_TIMEOUT"
+                ),
+
+            "error":
+                result.get(
+                    "error",
+                    "Unknown course error.",
+                ),
+
+            "classes":
+                [],
+        }
+
+    data = (
+        result.get(
+            "data"
+        )
+        or {}
+    )
+
+    raw_classes = (
+        data.get(
+            "classes",
+            []
+        )
+    )
+
+    simplified = []
+
+    for item in raw_classes:
+
+        parsed = (
+            simplify_asu_class(
+                item
+            )
+        )
+
+        if parsed:
+
+            simplified.append(
+                parsed
+            )
+
+    total_data = (
+        data.get(
+            "total"
+        )
+    )
+
+    if isinstance(
+        total_data,
+        dict,
+    ):
+
+        reported_total = (
+            total_data.get(
+                "value"
+            )
+        )
+
+    else:
+
+        reported_total = (
+            total_data
+        )
+
+    print(
+        f"{subject} {catalog_num}: "
+        f"ASU returned "
+        f"{len(simplified)} "
+        f"of "
+        f"{reported_total} "
+        "section(s)."
+    )
+
+    return {
+        "status":
+            "SUCCESS",
+
+        "subject":
+            subject,
+
+        "catalog_num":
+            catalog_num,
+
+        "reported_total":
+            reported_total,
+
+        "returned":
+            len(
+                simplified
+            ),
+
+        "classes":
+            simplified,
+
+        "scroll_id":
+            data.get(
+                "scrollId"
+            ),
+    }
+
+
+# ============================================================
+# COURSE RETRIES
+# ============================================================
+
+async def scrape_course(
+    page,
+    subject,
+    catalog_num,
+    term,
+):
+
+    last_result = None
+
+    for attempt in range(
+        1,
+        COURSE_MAX_ATTEMPTS + 1,
+    ):
+
+        print(
+            f"Loading "
+            f"{subject} {catalog_num} "
+            f"(attempt "
+            f"{attempt}/"
+            f"{COURSE_MAX_ATTEMPTS})..."
+        )
+
+        result = (
+            await scrape_course_once(
+                page,
+                subject,
+                catalog_num,
+                term,
+            )
+        )
+
+        last_result = (
+            result
+        )
+
+        if (
+            result.get(
+                "status"
+            ) ==
+            "SUCCESS"
+        ):
+
+            return result
+
+        if (
+            attempt >=
+            COURSE_MAX_ATTEMPTS
+        ):
+
+            break
+
+        delay = min(
+            2 ** (
+                attempt - 1
+            ),
+            6,
+        )
+
+        delay += random.uniform(
+            0.25,
+            1.0,
+        )
+
+        print(
+            f"{subject} {catalog_num}: "
+            f"{result.get('error_type')} - "
+            f"retrying in "
+            f"{delay:.1f}s..."
+        )
+
+        await asyncio.sleep(
+            delay
+        )
+
+    return last_result
+
+
+# ============================================================
+# INDIVIDUAL CLASS FALLBACK
+#
+# This still uses ASU's structured API response.
+# It does NOT parse rendered HTML.
+# ============================================================
+
+async def scrape_individual_class(
+    page,
+    class_num,
+    term,
+):
+
+    navigation_url = (
+        build_class_search_url(
+            class_num,
+            term,
+        )
+    )
+
+    class_marker = (
+        f"classNbr={class_num}"
+    )
+
+    term_marker = (
+        f"term={term}"
+    )
+
+    def matcher(
+        url,
+    ):
+
+        return (
+            class_marker in url
+            and
+            term_marker in url
+        )
+
+    result = (
+        await capture_search_response(
+            page,
+            navigation_url,
+            matcher,
+        )
+    )
+
+    if not result.get(
+        "ok"
+    ):
+
+        return None
+
+    data = (
+        result.get(
+            "data"
+        )
+        or {}
+    )
+
+    for item in data.get(
+        "classes",
+        []
+    ):
+
+        parsed = (
+            simplify_asu_class(
+                item
+            )
+        )
+
+        if (
+            parsed
+            and
+            parsed[
+                "class_num"
+            ] ==
+            str(
+                class_num
+            )
+        ):
+
+            return parsed
+
+    return None
+
+
+# ============================================================
+# PREPARE EA ROW UPDATE
+# ============================================================
+
+def prepare_row_update(
+    class_num,
+    scraped,
     daily_lookup,
+    previous_lookup,
+):
+
+    daily = (
+        daily_lookup.get(
+            class_num
+        )
+    )
+
+    if not daily:
+
+        return {
+            "status":
+                "ERROR",
+
+            "class_num":
+                class_num,
+
+            "error_type":
+                "MISSING_FROM_DAILY_SHEET",
+
+            "error":
+                (
+                    "Class was not found "
+                    "in today's EA sheet."
+                ),
+        }
+
+    row_number = (
+        daily[
+            "row_number"
+        ]
+    )
+
+    row_data = (
+        daily[
+            "row"
+        ]
+    )
+
+    previous = (
+        previous_lookup.get(
+            class_num,
+            {},
+        )
+    )
+
+    # --------------------------------------------------------
+    # TODAY
+    # --------------------------------------------------------
+
+    today_cap = str(
+        scraped.get(
+            "cap",
+            "",
+        )
+    ).strip()
+
+    today_open = str(
+        scraped.get(
+            "open",
+            "",
+        )
+    ).strip()
+
+    today_current = str(
+        scraped.get(
+            "current",
+            "",
+        )
+    ).strip()
+
+    last_name = str(
+        scraped.get(
+            "instructor_last",
+            "",
+        )
+    ).strip()
+
+    first_name = str(
+        scraped.get(
+            "instructor_first",
+            "",
+        )
+    ).strip()
+
+    # --------------------------------------------------------
+    # PREVIOUS
+    # --------------------------------------------------------
+
+    previous_amount = str(
+        previous.get(
+            "previous_amount",
+            "",
+        )
+    ).strip()
+
+    previous_capacity = str(
+        previous.get(
+            "previous_capacity",
+            "",
+        )
+    ).strip()
+
+    # --------------------------------------------------------
+    # INSTRUCTOR FALLBACK
+    # --------------------------------------------------------
+
+    if not last_name:
+
+        last_name = str(
+            previous.get(
+                "last_name",
+                (
+                    row_data[
+                        COL_INSTRUCTOR_LAST
+                    ]
+                    if len(row_data) >
+                    COL_INSTRUCTOR_LAST
+                    else ""
+                ),
+            )
+        ).strip()
+
+    if not first_name:
+
+        first_name = str(
+            previous.get(
+                "first_name",
+                (
+                    row_data[
+                        COL_INSTRUCTOR_FIRST
+                    ]
+                    if len(row_data) >
+                    COL_INSTRUCTOR_FIRST
+                    else ""
+                ),
+            )
+        ).strip()
+
+    # --------------------------------------------------------
+    # ENROLLMENT UPDATE
+    # --------------------------------------------------------
+
+    enrollment_update = (
+        calculate_difference(
+            today_current,
+            previous_amount,
+        )
+    )
+
+    enrollment_description = (
+        build_enrollment_description(
+            enrollment_update
+        )
+    )
+
+    # --------------------------------------------------------
+    # CHANGED
+    # --------------------------------------------------------
+
+    has_previous = bool(
+        previous
+    )
+
+    changed = False
+
+    if has_previous:
+
+        changed = (
+            today_cap !=
+            str(
+                previous.get(
+                    "cap",
+                    "",
+                )
+            ).strip()
+            or
+            today_open !=
+            str(
+                previous.get(
+                    "open",
+                    "",
+                )
+            ).strip()
+            or
+            today_current !=
+            str(
+                previous.get(
+                    "current",
+                    "",
+                )
+            ).strip()
+            or
+            last_name !=
+            str(
+                previous.get(
+                    "last_name",
+                    "",
+                )
+            ).strip()
+            or
+            first_name !=
+            str(
+                previous.get(
+                    "first_name",
+                    "",
+                )
+            ).strip()
+        )
+
+    # --------------------------------------------------------
+    # E:M
+    # --------------------------------------------------------
+
+    values = [
+
+        # E
+        last_name,
+
+        # F
+        first_name,
+
+        # G Previous Amount
+        previous_amount,
+
+        # H Enroll Cap
+        today_cap,
+
+        # I Open Seats
+        today_open,
+
+        # J Current
+        today_current,
+
+        # K Update
+        enrollment_update,
+
+        # L Previous enrollment capacity
+        previous_capacity,
+
+        # M Enroll Desc
+        enrollment_description,
+    ]
+
+    return {
+        "status":
+            "SUCCESS",
+
+        "class_num":
+            class_num,
+
+        "row_number":
+            row_number,
+
+        "range":
+            (
+                f"E{row_number}:"
+                f"M{row_number}"
+            ),
+
+        "values":
+            values,
+
+        "changed":
+            changed,
+
+        "has_previous":
+            has_previous,
+    }
+
+
+# ============================================================
+# WRITE ONE COURSE'S RESULTS
+# ============================================================
+
+def write_course_results(
+    sheet,
+    class_results,
+    daily_lookup,
+    previous_lookup,
 ):
 
     updates = []
 
-    changed_count = 0
-    unchanged_count = 0
+    results = []
 
-    error_count = 0
-    no_data_count = 0
+    changed = 0
+    unchanged = 0
 
-    error_classes = []
-    no_data_classes = []
+    for (
+        class_num,
+        scraped,
+    ) in class_results.items():
 
-    for result in (
-        batch_results
-    ):
-
-        class_num = str(
-            result[
-                "class_num"
-            ]
-        ).strip()
-
-        daily = (
-            daily_lookup.get(
-                class_num
-            )
-        )
-
-        # ----------------------------------------------------
-        # CLASS MISSING FROM DAILY SHEET
-        # ----------------------------------------------------
-
-        if not daily:
-
-            error_count += 1
-
-            error_classes.append({
-                "class_num":
-                    class_num,
-
-                "error_type":
-                    "MISSING_FROM_DAILY_SHEET",
-
-                "error":
-                    (
-                        "Class was not found "
-                        "in today's sheet."
-                    ),
-            })
-
-            print(
-                f"{class_num}: "
-                "NOT FOUND IN DAILY SHEET"
-            )
-
-            continue
-
-        row_number = (
-            daily[
-                "row_number"
-            ]
-        )
-
-        row_data = (
-            daily[
-                "row"
-            ]
-        )
-
-        previous = (
-            previous_lookup.get(
+        prepared = (
+            prepare_row_update(
                 class_num,
-                {},
+                scraped,
+                daily_lookup,
+                previous_lookup,
             )
         )
 
-        # ----------------------------------------------------
-        # SCRAPER ERROR
-        # ----------------------------------------------------
+        results.append(
+            prepared
+        )
 
         if (
-            result[
+            prepared[
                 "status"
-            ] ==
-            "ERROR"
+            ] !=
+            "SUCCESS"
         ):
 
-            error_count += 1
-
-            info = {
-                "class_num":
-                    class_num,
-
-                "error_type":
-                    result.get(
-                        "error_type",
-                        "UNKNOWN_ERROR",
-                    ),
-
-                "error":
-                    result.get(
-                        "error",
-                        "Unknown scraper error.",
-                    ),
-            }
-
-            error_classes.append(
-                info
-            )
-
-            print(
-                f"{class_num}: ERROR - "
-                f"{info['error_type']} - "
-                "keeping existing values."
-            )
-
             continue
-
-        # ----------------------------------------------------
-        # NO DATA
-        # ----------------------------------------------------
-
-        if (
-            result[
-                "status"
-            ] ==
-            "NO_DATA"
-        ):
-
-            no_data_count += 1
-
-            info = {
-                "class_num":
-                    class_num,
-
-                "error_type":
-                    result.get(
-                        "error_type",
-                        "NO_DATA",
-                    ),
-
-                "error":
-                    result.get(
-                        "error",
-                        "No data returned.",
-                    ),
-            }
-
-            no_data_classes.append(
-                info
-            )
-
-            print(
-                f"{class_num}: NO DATA - "
-                f"{info['error_type']} - "
-                "keeping existing values."
-            )
-
-            continue
-
-        # ====================================================
-        # SUCCESS
-        # ====================================================
-
-        last_name, first_name = (
-            split_instructor(
-                result.get(
-                    "instructor",
-                    "",
-                )
-            )
-        )
-
-        # ----------------------------------------------------
-        # TODAY'S ASU VALUES
-        # ----------------------------------------------------
-
-        today_cap = str(
-            result.get(
-                "cap",
-                "",
-            )
-        ).strip()
-
-        today_open = str(
-            result.get(
-                "open",
-                "",
-            )
-        ).strip()
-
-        today_current = str(
-            result.get(
-                "current",
-                "",
-            )
-        ).strip()
-
-        # ----------------------------------------------------
-        # HISTORICAL VALUES
-        #
-        # TODAY G
-        # Previous Amount
-        # = PREVIOUS DAY J Current
-        #
-        # TODAY L
-        # Previous enrollment capacity
-        # = PREVIOUS DAY H Enroll Cap
-        # ----------------------------------------------------
-
-        previous_amount = str(
-            previous.get(
-                "previous_amount",
-                "",
-            )
-        ).strip()
-
-        previous_capacity = str(
-            previous.get(
-                "previous_capacity",
-                "",
-            )
-        ).strip()
-
-        # ----------------------------------------------------
-        # INSTRUCTOR FALLBACK
-        # ----------------------------------------------------
-
-        if not last_name:
-
-            last_name = str(
-                previous.get(
-                    "last_name",
-                    (
-                        row_data[
-                            COL_INSTRUCTOR_LAST
-                        ]
-                        if len(row_data) >
-                        COL_INSTRUCTOR_LAST
-                        else ""
-                    ),
-                )
-            ).strip()
-
-        if not first_name:
-
-            first_name = str(
-                previous.get(
-                    "first_name",
-                    (
-                        row_data[
-                            COL_INSTRUCTOR_FIRST
-                        ]
-                        if len(row_data) >
-                        COL_INSTRUCTOR_FIRST
-                        else ""
-                    ),
-                )
-            ).strip()
-
-        # ----------------------------------------------------
-        # UPDATE
-        #
-        # K =
-        # TODAY Current
-        # -
-        # PREVIOUS DAY Current
-        # ----------------------------------------------------
-
-        enrollment_update = (
-            calculate_difference(
-                today_current,
-                previous_amount,
-            )
-        )
-
-        # ----------------------------------------------------
-        # ENROLL DESC
-        # ----------------------------------------------------
-
-        enrollment_description = (
-            build_enrollment_description(
-                enrollment_update
-            )
-        )
-
-        # ----------------------------------------------------
-        # CHANGED / UNCHANGED
-        # ----------------------------------------------------
-
-        has_previous = bool(
-            previous
-        )
-
-        previous_cap = str(
-            previous.get(
-                "cap",
-                "",
-            )
-        ).strip()
-
-        previous_open = str(
-            previous.get(
-                "open",
-                "",
-            )
-        ).strip()
-
-        previous_current = str(
-            previous.get(
-                "current",
-                "",
-            )
-        ).strip()
-
-        previous_last = str(
-            previous.get(
-                "last_name",
-                "",
-            )
-        ).strip()
-
-        previous_first = str(
-            previous.get(
-                "first_name",
-                "",
-            )
-        ).strip()
-
-        changed = False
-
-        if has_previous:
-
-            changed = (
-                today_cap !=
-                previous_cap
-                or
-                today_open !=
-                previous_open
-                or
-                today_current !=
-                previous_current
-                or
-                last_name !=
-                previous_last
-                or
-                first_name !=
-                previous_first
-            )
-
-        if changed:
-
-            changed_count += 1
-
-            print(
-                f"{class_num}: CHANGED "
-                f"| Enrollment "
-                f"{previous_amount} -> "
-                f"{today_current} "
-                f"| Capacity "
-                f"{previous_capacity} -> "
-                f"{today_cap}"
-            )
-
-        else:
-
-            unchanged_count += 1
-
-            if has_previous:
-
-                print(
-                    f"{class_num}: "
-                    "UNCHANGED"
-                )
-
-            else:
-
-                print(
-                    f"{class_num}: "
-                    "FIRST OBSERVATION"
-                )
-
-        # ====================================================
-        # WRITE E:M
-        #
-        # E Instructor Last Name
-        # F Instructor First Name
-        # G Previous Amount
-        # H Enroll Cap
-        # I Open Seats
-        # J Current
-        # K Update
-        # L Previous enrollment capacity
-        # M Enroll Desc
-        # ====================================================
-
-        new_row_values = [
-
-            # E
-            last_name,
-
-            # F
-            first_name,
-
-            # G
-            previous_amount,
-
-            # H
-            today_cap,
-
-            # I
-            today_open,
-
-            # J
-            today_current,
-
-            # K
-            enrollment_update,
-
-            # L
-            previous_capacity,
-
-            # M
-            enrollment_description,
-        ]
 
         updates.append({
             "range":
-                f"E{row_number}:"
-                f"M{row_number}",
+                prepared[
+                    "range"
+                ],
 
             "values": [
-                new_row_values
+                prepared[
+                    "values"
+                ]
             ],
         })
 
-        # Keep local copy synchronized.
-        while (
-            len(row_data) <=
-            COL_ENROLL_DESC
+        if (
+            prepared[
+                "changed"
+            ]
         ):
 
-            row_data.append(
-                ""
-            )
+            changed += 1
 
-        row_data[
-            COL_INSTRUCTOR_LAST:
-            COL_ENROLL_DESC + 1
-        ] = (
-            new_row_values
-        )
+        else:
 
-    # ========================================================
-    # BATCH WRITE
-    # ========================================================
+            unchanged += 1
 
     if updates:
-
-        print(
-            f"Writing "
-            f"{len(updates)} "
-            "successful rows..."
-        )
 
         google_retry(
             lambda:
                 sheet.batch_update(
                     updates
                 ),
-            "Batch enrollment update",
-        )
-
-        print(
-            "Batch sheet update complete."
+            "Write course enrollment data",
         )
 
     return {
+        "results":
+            results,
+
         "changed":
-            changed_count,
+            changed,
 
         "unchanged":
-            unchanged_count,
-
-        "errors":
-            error_count,
-
-        "needs_review":
-            no_data_count,
-
-        "error_classes":
-            error_classes,
-
-        "no_data_classes":
-            no_data_classes,
+            unchanged,
     }
-
-
-# ============================================================
-# PROCESS SCRAPER BATCH
-# ============================================================
-
-async def process_scrape_batch(
-    context,
-    batch,
-    term,
-):
-
-    return await asyncio.gather(
-        *[
-            scrape_class(
-                context,
-                class_num,
-                term,
-            )
-            for class_num
-            in batch
-        ]
-    )
 
 
 # ============================================================
@@ -1788,45 +2069,13 @@ async def main(
     sheet_url,
     sheet_name,
     term,
-    concurrency=CONCURRENCY,
+    concurrency=2,
     progress_callback=None,
 ):
 
-    # --------------------------------------------------------
-    # CONCURRENCY
-    # --------------------------------------------------------
-
-    try:
-
-        concurrency = int(
-            concurrency
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ):
-
-        concurrency = (
-            CONCURRENCY
-        )
-
-    concurrency = max(
-        1,
-        min(
-            concurrency,
-            3,
-        ),
-    )
-
-    print(
-        "Enrollment concurrency:",
-        concurrency,
-    )
-
-    # --------------------------------------------------------
-    # CURRENT SHEET
-    # --------------------------------------------------------
+    # ========================================================
+    # GOOGLE SHEETS
+    # ========================================================
 
     sheet = get_sheet(
         sheet_url,
@@ -1836,10 +2085,6 @@ async def main(
     spreadsheet = (
         sheet.spreadsheet
     )
-
-    # --------------------------------------------------------
-    # PREVIOUS RUN
-    # --------------------------------------------------------
 
     previous_sheet = (
         get_previous_run_sheet(
@@ -1854,10 +2099,6 @@ async def main(
         )
     )
 
-    # --------------------------------------------------------
-    # CURRENT DAILY DATA
-    # --------------------------------------------------------
-
     all_values = google_retry(
         lambda:
             sheet.get_all_values(),
@@ -1865,425 +2106,45 @@ async def main(
     )
 
     daily_lookup = (
-        build_daily_row_lookup(
+        build_daily_lookup(
             all_values
         )
     )
 
-    raw_class_nums = []
-
-    for row in (
-        all_values[1:]
-    ):
-
-        if (
-            len(row) >
-            COL_CLASS_NUM
-            and
-            row[
-                COL_CLASS_NUM
-            ]
-        ):
-
-            raw_class_nums.append(
-                str(
-                    row[
-                        COL_CLASS_NUM
-                    ]
-                ).strip()
-            )
-
-    # --------------------------------------------------------
-    # DEDUPLICATE CLASS NUMBERS
-    # --------------------------------------------------------
-
-    seen = set()
-
-    class_nums = []
-
-    for class_num in (
-        raw_class_nums
-    ):
-
-        if class_num in seen:
-
-            print(
-                f"{class_num}: "
-                "DUPLICATE - skipping."
-            )
-
-            continue
-
-        seen.add(
-            class_num
+    course_groups, invalid_classes = (
+        build_course_groups(
+            daily_lookup
         )
+    )
 
-        class_nums.append(
-            class_num
-        )
-
-    duplicate_count = (
+    total_classes = (
         len(
-            raw_class_nums
+            daily_lookup
         )
-        -
+    )
+
+    total_courses = (
         len(
-            class_nums
+            course_groups
         )
     )
-
-    print(
-        f"Found "
-        f"{len(class_nums)} "
-        "unique classes."
-    )
-
-    # --------------------------------------------------------
-    # START CALLBACK
-    # --------------------------------------------------------
-
-    if progress_callback:
-
-        progress_callback({
-            "type":
-                "start",
-
-            "message":
-                (
-                    f"Found "
-                    f"{len(class_nums)} "
-                    "unique classes."
-                ),
-
-            "total":
-                len(
-                    class_nums
-                ),
-
-            "processed":
-                0,
-
-            "successful":
-                0,
-
-            "errors":
-                0,
-
-            "needs_review":
-                0,
-        })
-
-    # --------------------------------------------------------
-    # CUMULATIVE STATE
-    # --------------------------------------------------------
-
-    all_results = []
-
-    total_changed = 0
-
-    total_unchanged = 0
-
-    total_errors = 0
-
-    total_no_data = 0
-
-    all_error_classes = []
-
-    all_no_data_classes = []
-
-    # ========================================================
-    # PLAYWRIGHT
-    # ========================================================
-
-    async with (
-        async_playwright()
-        as p
-    ):
-
-        browser = (
-            await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                ],
-            )
-        )
-
-        context = (
-            await browser
-            .new_context()
-        )
-
-        iterator = iter(
-            class_nums
-        )
-
-        try:
-
-            while True:
-
-                # --------------------------------------------
-                # CANCELLATION CHECKPOINT
-                # --------------------------------------------
-
-                if progress_callback:
-
-                    progress_callback({
-                        "type":
-                            "checkpoint",
-
-                        "message":
-                            (
-                                "Checking job status "
-                                "before next batch."
-                            ),
-
-                        "processed":
-                            len(
-                                all_results
-                            ),
-
-                        "total":
-                            len(
-                                class_nums
-                            ),
-                    })
-
-                # --------------------------------------------
-                # NEXT BATCH
-                # --------------------------------------------
-
-                batch = list(
-                    islice(
-                        iterator,
-                        concurrency,
-                    )
-                )
-
-                if not batch:
-
-                    break
-
-                print(
-                    f"Processing batch: "
-                    f"{batch}"
-                )
-
-                if progress_callback:
-
-                    progress_callback({
-                        "type":
-                            "batch_start",
-
-                        "message":
-                            (
-                                f"Processing batch: "
-                                f"{batch}"
-                            ),
-
-                        "processed":
-                            len(
-                                all_results
-                            ),
-
-                        "total":
-                            len(
-                                class_nums
-                            ),
-                    })
-
-                # --------------------------------------------
-                # SCRAPE
-                # --------------------------------------------
-
-                batch_results = (
-                    await
-                    process_scrape_batch(
-                        context,
-                        batch,
-                        term,
-                    )
-                )
-
-                all_results.extend(
-                    batch_results
-                )
-
-                # --------------------------------------------
-                # WRITE BATCH
-                # --------------------------------------------
-
-                batch_summary = (
-                    update_batch(
-                        sheet,
-                        batch_results,
-                        previous_lookup,
-                        daily_lookup,
-                    )
-                )
-
-                total_changed += (
-                    batch_summary[
-                        "changed"
-                    ]
-                )
-
-                total_unchanged += (
-                    batch_summary[
-                        "unchanged"
-                    ]
-                )
-
-                total_errors += (
-                    batch_summary[
-                        "errors"
-                    ]
-                )
-
-                total_no_data += (
-                    batch_summary[
-                        "needs_review"
-                    ]
-                )
-
-                all_error_classes.extend(
-                    batch_summary[
-                        "error_classes"
-                    ]
-                )
-
-                all_no_data_classes.extend(
-                    batch_summary[
-                        "no_data_classes"
-                    ]
-                )
-
-                successful_so_far = sum(
-                    1
-                    for item
-                    in all_results
-                    if (
-                        item[
-                            "status"
-                        ] ==
-                        "SUCCESS"
-                    )
-                )
-
-                # --------------------------------------------
-                # PROGRESS CALLBACK
-                # --------------------------------------------
-
-                if progress_callback:
-
-                    progress_callback({
-                        "type":
-                            "batch_complete",
-
-                        "message":
-                            (
-                                f"Processed "
-                                f"{len(all_results)} "
-                                f"of "
-                                f"{len(class_nums)} "
-                                "classes."
-                            ),
-
-                        "batch":
-                            batch,
-
-                        "processed":
-                            len(
-                                all_results
-                            ),
-
-                        "total":
-                            len(
-                                class_nums
-                            ),
-
-                        "successful":
-                            successful_so_far,
-
-                        "changed":
-                            total_changed,
-
-                        "unchanged":
-                            total_unchanged,
-
-                        "errors":
-                            total_errors,
-
-                        "needs_review":
-                            total_no_data,
-
-                        "results":
-                            batch_results,
-                    })
-
-                # --------------------------------------------
-                # DELAY BETWEEN BATCHES
-                # --------------------------------------------
-
-                if (
-                    len(
-                        all_results
-                    )
-                    <
-                    len(
-                        class_nums
-                    )
-                ):
-
-                    delay = (
-                        random.uniform(
-                            BATCH_DELAY_MIN,
-                            BATCH_DELAY_MAX,
-                        )
-                    )
-
-                    print(
-                        f"Waiting "
-                        f"{delay:.1f}s "
-                        "before next batch."
-                    )
-
-                    await asyncio.sleep(
-                        delay
-                    )
-
-        finally:
-
-            await browser.close()
-
-    # ========================================================
-    # FINAL COUNTS
-    # ========================================================
-
-    successful = sum(
-        1
-        for item
-        in all_results
-        if (
-            item[
-                "status"
-            ] ==
-            "SUCCESS"
-        )
-    )
-
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
 
     print(
         "========================================"
     )
 
     print(
-        "ENROLLMENT RUN COMPLETE"
+        "COURSE-LEVEL ENROLLMENT SCRAPER"
+    )
+
+    print(
+        f"Classes required: "
+        f"{total_classes}"
+    )
+
+    print(
+        f"Unique courses: "
+        f"{total_courses}"
     )
 
     print(
@@ -2296,8 +2157,552 @@ async def main(
     )
 
     print(
+        "========================================"
+    )
+
+    if invalid_classes:
+
+        print(
+            "Classes missing Subject/Catalog Num:",
+            invalid_classes,
+        )
+
+    if progress_callback:
+
+        progress_callback({
+            "type":
+                "start",
+
+            "message":
+                (
+                    f"Found "
+                    f"{total_classes} "
+                    f"classes across "
+                    f"{total_courses} "
+                    "unique courses."
+                ),
+
+            "total":
+                total_classes,
+
+            "processed":
+                0,
+
+            "successful":
+                0,
+
+            "changed":
+                0,
+
+            "unchanged":
+                0,
+
+            "errors":
+                0,
+
+            "needs_review":
+                0,
+        })
+
+    # ========================================================
+    # COUNTERS
+    # ========================================================
+
+    processed = 0
+    successful = 0
+
+    total_changed = 0
+    total_unchanged = 0
+
+    total_errors = 0
+    total_needs_review = 0
+
+    error_classes = []
+    no_data_classes = []
+
+    # Classes we've successfully found.
+    found_classes = set()
+
+    # ========================================================
+    # PLAYWRIGHT
+    # ========================================================
+
+    async with async_playwright() as p:
+
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+
+        context = (
+            await browser.new_context()
+        )
+
+        page = (
+            await context.new_page()
+        )
+
+        try:
+
+            # =================================================
+            # COURSE LOOP
+            # =================================================
+
+            for (
+                course_index,
+                (
+                    course_key,
+                    wanted_class_nums,
+                ),
+            ) in enumerate(
+                course_groups.items(),
+                start=1,
+            ):
+
+                (
+                    subject,
+                    catalog_num,
+                ) = course_key
+
+                # --------------------------------------------
+                # CANCELLATION CHECK
+                # --------------------------------------------
+
+                if progress_callback:
+
+                    progress_callback({
+                        "type":
+                            "checkpoint",
+
+                        "message":
+                            (
+                                "Checking job status "
+                                f"before "
+                                f"{subject} "
+                                f"{catalog_num}."
+                            ),
+
+                        "processed":
+                            processed,
+
+                        "total":
+                            total_classes,
+                    })
+
+                # --------------------------------------------
+                # COURSE
+                # --------------------------------------------
+
+                print(
+                    "\n----------------------------------------"
+                )
+
+                print(
+                    f"Course "
+                    f"{course_index}/"
+                    f"{total_courses}: "
+                    f"{subject} "
+                    f"{catalog_num}"
+                )
+
+                print(
+                    "Required Class Nums:",
+                    sorted(
+                        wanted_class_nums
+                    ),
+                )
+
+                if progress_callback:
+
+                    progress_callback({
+                        "type":
+                            "batch_start",
+
+                        "message":
+                            (
+                                f"Loading "
+                                f"{subject} "
+                                f"{catalog_num} "
+                                f"({course_index}/"
+                                f"{total_courses})."
+                            ),
+
+                        "processed":
+                            processed,
+
+                        "total":
+                            total_classes,
+                    })
+
+                course_result = (
+                    await scrape_course(
+                        page,
+                        subject,
+                        catalog_num,
+                        term,
+                    )
+                )
+
+                # --------------------------------------------
+                # COURSE FAILURE
+                # --------------------------------------------
+
+                if (
+                    not course_result
+                    or
+                    course_result.get(
+                        "status"
+                    ) !=
+                    "SUCCESS"
+                ):
+
+                    print(
+                        f"{subject} "
+                        f"{catalog_num}: "
+                        "course search failed."
+                    )
+
+                    # We will individually retry all required
+                    # classes from this course below.
+                    returned_lookup = {}
+
+                else:
+
+                    returned_lookup = {
+                        item[
+                            "class_num"
+                        ]:
+                            item
+
+                        for item
+                        in course_result.get(
+                            "classes",
+                            []
+                        )
+
+                        if item.get(
+                            "class_num"
+                        )
+                    }
+
+                # --------------------------------------------
+                # FILTER TO EA CLASS NUMS ONLY
+                # --------------------------------------------
+
+                matched = {}
+
+                missing = []
+
+                for class_num in (
+                    wanted_class_nums
+                ):
+
+                    scraped = (
+                        returned_lookup.get(
+                            class_num
+                        )
+                    )
+
+                    if scraped:
+
+                        matched[
+                            class_num
+                        ] = scraped
+
+                        found_classes.add(
+                            class_num
+                        )
+
+                    else:
+
+                        missing.append(
+                            class_num
+                        )
+
+                print(
+                    f"{subject} "
+                    f"{catalog_num}: "
+                    f"matched "
+                    f"{len(matched)}/"
+                    f"{len(wanted_class_nums)} "
+                    "required classes."
+                )
+
+                # =================================================
+                # INDIVIDUAL FALLBACK FOR MISSING CLASSES
+                # =================================================
+
+                if missing:
+
+                    print(
+                        "Missing from course response:",
+                        missing,
+                    )
+
+                    for class_num in (
+                        missing
+                    ):
+
+                        if progress_callback:
+
+                            progress_callback({
+                                "type":
+                                    "checkpoint",
+
+                                "message":
+                                    (
+                                        "Checking job status "
+                                        "before fallback "
+                                        f"{class_num}."
+                                    ),
+
+                                "processed":
+                                    processed,
+
+                                "total":
+                                    total_classes,
+                            })
+
+                        print(
+                            f"{class_num}: "
+                            "running individual "
+                            "API-response fallback."
+                        )
+
+                        fallback = (
+                            await
+                            scrape_individual_class(
+                                page,
+                                class_num,
+                                term,
+                            )
+                        )
+
+                        if fallback:
+
+                            matched[
+                                class_num
+                            ] = fallback
+
+                            found_classes.add(
+                                class_num
+                            )
+
+                        else:
+
+                            total_errors += 1
+
+                            error_info = {
+                                "class_num":
+                                    class_num,
+
+                                "error_type":
+                                    "CLASS_NOT_RETURNED",
+
+                                "error":
+                                    (
+                                        "Class was not returned "
+                                        "by its course search or "
+                                        "individual fallback."
+                                    ),
+                            }
+
+                            error_classes.append(
+                                error_info
+                            )
+
+                # =================================================
+                # WRITE MATCHED COURSE RESULTS
+                # =================================================
+
+                write_summary = (
+                    write_course_results(
+                        sheet,
+                        matched,
+                        daily_lookup,
+                        previous_lookup,
+                    )
+                )
+
+                course_successful = (
+                    len(
+                        matched
+                    )
+                )
+
+                successful += (
+                    course_successful
+                )
+
+                processed += (
+                    len(
+                        wanted_class_nums
+                    )
+                )
+
+                total_changed += (
+                    write_summary[
+                        "changed"
+                    ]
+                )
+
+                total_unchanged += (
+                    write_summary[
+                        "unchanged"
+                    ]
+                )
+
+                # --------------------------------------------
+                # PROGRESS RESULT OBJECTS
+                # --------------------------------------------
+
+                callback_results = []
+
+                for class_num in (
+                    wanted_class_nums
+                ):
+
+                    if (
+                        class_num in
+                        matched
+                    ):
+
+                        callback_results.append({
+                            "class_num":
+                                class_num,
+
+                            "status":
+                                "SUCCESS",
+                        })
+
+                    else:
+
+                        callback_results.append({
+                            "class_num":
+                                class_num,
+
+                            "status":
+                                "ERROR",
+
+                            "error_type":
+                                "CLASS_NOT_RETURNED",
+                        })
+
+                if progress_callback:
+
+                    progress_callback({
+                        "type":
+                            "batch_complete",
+
+                        "message":
+                            (
+                                f"Completed "
+                                f"{subject} "
+                                f"{catalog_num}. "
+                                f"Processed "
+                                f"{processed} "
+                                f"of "
+                                f"{total_classes} "
+                                "classes."
+                            ),
+
+                        "batch":
+                            sorted(
+                                wanted_class_nums
+                            ),
+
+                        "processed":
+                            processed,
+
+                        "total":
+                            total_classes,
+
+                        "successful":
+                            successful,
+
+                        "changed":
+                            total_changed,
+
+                        "unchanged":
+                            total_unchanged,
+
+                        "errors":
+                            total_errors,
+
+                        "needs_review":
+                            total_needs_review,
+
+                        "results":
+                            callback_results,
+                    })
+
+                # --------------------------------------------
+                # SMALL DELAY
+                # --------------------------------------------
+
+                if (
+                    course_index <
+                    total_courses
+                ):
+
+                    delay = (
+                        random.uniform(
+                            COURSE_DELAY_MIN,
+                            COURSE_DELAY_MAX,
+                        )
+                    )
+
+                    await asyncio.sleep(
+                        delay
+                    )
+
+        finally:
+
+            await browser.close()
+
+    # ========================================================
+    # INVALID EA ROWS
+    # ========================================================
+
+    for class_num in (
+        invalid_classes
+    ):
+
+        total_errors += 1
+
+        error_classes.append({
+            "class_num":
+                class_num,
+
+            "error_type":
+                "MISSING_COURSE_INFORMATION",
+
+            "error":
+                (
+                    "EA row is missing "
+                    "Subject or Catalog Num."
+                ),
+        })
+
+    # ========================================================
+    # FINAL
+    # ========================================================
+
+    print(
+        "\n========================================"
+    )
+
+    print(
+        "ENROLLMENT RUN COMPLETE"
+    )
+
+    print(
         f"Classes processed: "
-        f"{len(all_results)}"
+        f"{processed}"
     )
 
     print(
@@ -2321,22 +2726,13 @@ async def main(
     )
 
     print(
-        f"Needs Review: "
-        f"{total_no_data}"
-    )
-
-    print(
-        f"Duplicates skipped: "
-        f"{duplicate_count}"
+        f"Unique courses: "
+        f"{total_courses}"
     )
 
     print(
         "========================================"
     )
-
-    # --------------------------------------------------------
-    # FINAL CALLBACK
-    # --------------------------------------------------------
 
     if progress_callback:
 
@@ -2348,14 +2744,10 @@ async def main(
                 "Enrollment run complete.",
 
             "processed":
-                len(
-                    all_results
-                ),
+                processed,
 
             "total":
-                len(
-                    class_nums
-                ),
+                total_classes,
 
             "successful":
                 successful,
@@ -2370,21 +2762,15 @@ async def main(
                 total_errors,
 
             "needs_review":
-                total_no_data,
+                total_needs_review,
         })
-
-    # --------------------------------------------------------
-    # RETURN
-    # --------------------------------------------------------
 
     return {
         "status":
             "success",
 
         "classes_processed":
-            len(
-                all_results
-            ),
+            processed,
 
         "successful":
             successful,
@@ -2399,7 +2785,7 @@ async def main(
             total_errors,
 
         "needs_review":
-            total_no_data,
+            total_needs_review,
 
         "previous_sheet":
             (
@@ -2408,17 +2794,14 @@ async def main(
                 else None
             ),
 
-        "duplicates_skipped":
-            duplicate_count,
+        "unique_courses":
+            total_courses,
 
         "error_classes":
-            all_error_classes,
+            error_classes,
 
         "no_data_classes":
-            all_no_data_classes,
-
-        "results":
-            all_results,
+            no_data_classes,
     }
 
 
@@ -2430,7 +2813,7 @@ def run_enrollment(
     sheet_url,
     sheet_name,
     term,
-    concurrency=CONCURRENCY,
+    concurrency=2,
     progress_callback=None,
 ):
 
@@ -2444,6 +2827,12 @@ def run_enrollment(
         )
     )
 
+
+# ============================================================
+# OPTIONAL DIAGNOSTIC
+#
+# Keeps /diagnose-asu working while we test the new scraper.
+# ============================================================
 
 async def diagnose_asu_api(
     subject="PHY",
@@ -2462,608 +2851,38 @@ async def diagnose_asu_api(
             ],
         )
 
-        context = await browser.new_context()
-
-        page = await context.new_page()
-
-        # ====================================================
-        # RESULTS
-        # ====================================================
-
-        captured_requests = []
-
-        course_result = {
-            "found": False,
-            "status": None,
-            "url": None,
-            "reported_total": None,
-            "returned": 0,
-            "scroll_id_present": False,
-            "classes": [],
-        }
-
-        response_complete = asyncio.Event()
-
-        # ====================================================
-        # REQUEST LISTENER
-        # ====================================================
-
-        async def handle_request(
-            request,
-        ):
-
-            url = request.url
-
-            if (
-                "catalog-microservices"
-                not in url
-            ):
-                return
-
-            captured_requests.append({
-                "method":
-                    request.method,
-
-                "url":
-                    url,
-            })
-
-            print(
-                "ASU API REQUEST:",
-                request.method,
-                url,
-            )
-
-        # ====================================================
-        # RESPONSE LISTENER
-        #
-        # IMPORTANT:
-        #
-        # We are NOT making our own API request.
-        #
-        # We allow ASU's frontend to make its normal
-        # authenticated request and capture its response.
-        # ====================================================
-
-        async def handle_response(
-            response,
-        ):
-
-            url = response.url
-
-            if (
-                "/search/classes"
-                not in url
-            ):
-                return
-
-            # Only capture the course request we care about.
-            if (
-                f"subject={subject}"
-                not in url
-            ):
-                return
-
-            if (
-                f"catalogNbr={catalog_num}"
-                not in url
-            ):
-                return
-
-            print(
-                "\n========================================"
-            )
-
-            print(
-                "COURSE API RESPONSE CAPTURED"
-            )
-
-            print(
-                "========================================"
-            )
-
-            print(
-                "STATUS:",
-                response.status,
-            )
-
-            print(
-                "URL:",
-                url,
-            )
-
-            # ------------------------------------------------
-            # MUST BE SUCCESSFUL
-            # ------------------------------------------------
-
-            if (
-                response.status != 200
-            ):
-
-                course_result[
-                    "found"
-                ] = True
-
-                course_result[
-                    "status"
-                ] = response.status
-
-                course_result[
-                    "url"
-                ] = url
-
-                response_complete.set()
-
-                return
-
-            # ------------------------------------------------
-            # JSON
-            # ------------------------------------------------
-
-            try:
-
-                data = (
-                    await response.json()
-                )
-
-            except Exception as error:
-
-                print(
-                    "Could not parse response:",
-                    type(error).__name__,
-                    str(error),
-                )
-
-                course_result[
-                    "found"
-                ] = True
-
-                course_result[
-                    "status"
-                ] = response.status
-
-                course_result[
-                    "url"
-                ] = url
-
-                response_complete.set()
-
-                return
-
-            classes = (
-                data.get(
-                    "classes",
-                    []
-                )
-            )
-
-            total_data = (
-                data.get(
-                    "total"
-                )
-            )
-
-            if isinstance(
-                total_data,
-                dict,
-            ):
-
-                total = (
-                    total_data.get(
-                        "value"
-                    )
-                )
-
-            else:
-
-                total = (
-                    total_data
-                )
-
-            scroll_id = (
-                data.get(
-                    "scrollId"
-                )
-            )
-
-            # =================================================
-            # SIMPLIFY CLASSES
-            # =================================================
-
-            simplified = []
-
-            for item in classes:
-
-                if not isinstance(
-                    item,
-                    dict,
-                ):
-                    continue
-
-                clas = (
-                    item.get(
-                        "CLAS",
-                        {}
-                    )
-                )
-
-                if not isinstance(
-                    clas,
-                    dict,
-                ):
-                    continue
-
-                # --------------------------------------------
-                # SEATS
-                # --------------------------------------------
-
-                seat_info = (
-                    item.get(
-                        "seatInfo",
-                        {}
-                    )
-                )
-
-                if not isinstance(
-                    seat_info,
-                    dict,
-                ):
-
-                    seat_info = {}
-
-                enroll_cap = (
-                    seat_info.get(
-                        "ENRL_CAP"
-                    )
-                )
-
-                enroll_total = (
-                    seat_info.get(
-                        "ENRL_TOT"
-                    )
-                )
-
-                # Fallback to CLAS.
-                if enroll_cap is None:
-
-                    enroll_cap = (
-                        clas.get(
-                            "ENRLCAP"
-                        )
-                    )
-
-                if enroll_total is None:
-
-                    enroll_total = (
-                        clas.get(
-                            "ENRLTOT"
-                        )
-                    )
-
-                # --------------------------------------------
-                # OPEN SEATS
-                # --------------------------------------------
-
-                open_seats = None
-
-                try:
-
-                    if (
-                        enroll_cap is not None
-                        and
-                        enroll_total is not None
-                    ):
-
-                        open_seats = (
-                            int(
-                                enroll_cap
-                            )
-                            -
-                            int(
-                                enroll_total
-                            )
-                        )
-
-                except (
-                    TypeError,
-                    ValueError,
-                ):
-
-                    open_seats = None
-
-                # --------------------------------------------
-                # INSTRUCTOR
-                # --------------------------------------------
-
-                first_names = (
-                    clas.get(
-                        "INSTRUCTORSFIRSTNAMESHOWALL"
-                    )
-                    or
-                    clas.get(
-                        "INSTRUCTORSFIRSTNAMELIST"
-                    )
-                    or
-                    []
-                )
-
-                last_names = (
-                    clas.get(
-                        "INSTRUCTORSLASTNAMESHOWALL"
-                    )
-                    or
-                    clas.get(
-                        "INSTRUCTORSLASTNAMELIST"
-                    )
-                    or
-                    []
-                )
-
-                instructor_first = ""
-
-                instructor_last = ""
-
-                if first_names:
-
-                    instructor_first = str(
-                        first_names[0]
-                    ).split(
-                        "~"
-                    )[0]
-
-                if last_names:
-
-                    instructor_last = str(
-                        last_names[0]
-                    ).split(
-                        "~"
-                    )[0]
-
-                # --------------------------------------------
-                # RESULT
-                # --------------------------------------------
-
-                simplified.append({
-
-                    "class_num":
-                        str(
-                            clas.get(
-                                "CLASSNBR",
-                                "",
-                            )
-                        ),
-
-                    "subject":
-                        clas.get(
-                            "SUBJECT"
-                        ),
-
-                    "catalog_num":
-                        clas.get(
-                            "CATALOGNBR"
-                        ),
-
-                    "section":
-                        clas.get(
-                            "CLASSSECTION"
-                        ),
-
-                    "session":
-                        clas.get(
-                            "SESSIONCODE"
-                        ),
-
-                    "component":
-                        clas.get(
-                            "SSRCOMPONENT"
-                        ),
-
-                    "title":
-                        clas.get(
-                            "TITLE"
-                        ),
-
-                    "instructor_last":
-                        instructor_last,
-
-                    "instructor_first":
-                        instructor_first,
-
-                    "enroll_cap":
-                        enroll_cap,
-
-                    "enroll_total":
-                        enroll_total,
-
-                    "open_seats":
-                        open_seats,
-                })
-
-            # =================================================
-            # STORE
-            # =================================================
-
-            course_result[
-                "found"
-            ] = True
-
-            course_result[
-                "status"
-            ] = response.status
-
-            course_result[
-                "url"
-            ] = url
-
-            course_result[
-                "reported_total"
-            ] = total
-
-            course_result[
-                "returned"
-            ] = len(
-                simplified
-            )
-
-            course_result[
-                "scroll_id_present"
-            ] = bool(
-                scroll_id
-            )
-
-            course_result[
-                "classes"
-            ] = simplified
-
-            # =================================================
-            # LOG SUMMARY
-            # =================================================
-
-            print(
-                "Reported total:",
-                total,
-            )
-
-            print(
-                "Returned:",
-                len(
-                    simplified
-                ),
-            )
-
-            print(
-                "Scroll ID:",
-                bool(
-                    scroll_id
-                ),
-            )
-
-            for item in simplified:
-
-                print(
-                    (
-                        f"{item['class_num']} | "
-                        f"{item['component']} | "
-                        f"Cap "
-                        f"{item['enroll_cap']} | "
-                        f"Enrolled "
-                        f"{item['enroll_total']} | "
-                        f"Open "
-                        f"{item['open_seats']}"
-                    )
-                )
-
-            response_complete.set()
-
-        # ====================================================
-        # REGISTER LISTENERS
-        # ====================================================
-
-        page.on(
-            "request",
-            handle_request,
+        context = (
+            await browser.new_context()
         )
 
-        page.on(
-            "response",
-            handle_response,
-        )
-
-        # ====================================================
-        # NORMAL ASU COURSE SEARCH
-        #
-        # ASU's own JavaScript makes the authenticated
-        # /search/classes request.
-        # ====================================================
-
-        url = (
-            "https://catalog.apps.asu.edu/"
-            "catalog/classes/classlist?"
-            "advanced=true"
-            "&campusOrOnlineSelection=A"
-            f"&catalogNbr={catalog_num}"
-            "&honors=F"
-            "&promod=F"
-            "&searchType=all"
-            f"&subject={subject}"
-            f"&term={term}"
-        )
-
-        print(
-            "\n========================================"
-        )
-
-        print(
-            "OPENING ASU COURSE SEARCH"
-        )
-
-        print(
-            f"{subject} {catalog_num}"
-        )
-
-        print(
-            "========================================"
-        )
-
-        print(
-            url
+        page = (
+            await context.new_page()
         )
 
         try:
 
-            await page.goto(
-                url,
-                timeout=60000,
-                wait_until="domcontentloaded",
+            result = (
+                await scrape_course(
+                    page,
+                    subject,
+                    catalog_num,
+                    term,
+                )
             )
 
-        except PlaywrightTimeoutError:
+        finally:
 
-            print(
-                "Navigation timed out. "
-                "Waiting for API response anyway."
-            )
-
-        # ====================================================
-        # WAIT FOR ASU'S API RESPONSE
-        # ====================================================
-
-        try:
-
-            await asyncio.wait_for(
-                response_complete.wait(),
-                timeout=30,
-            )
-
-        except asyncio.TimeoutError:
-
-            print(
-                "Timed out waiting for "
-                "course API response."
-            )
-
-        # Small buffer for response handler.
-        await page.wait_for_timeout(
-            500
-        )
-
-        await browser.close()
-
-        # ====================================================
-        # RETURN
-        # ====================================================
+            await browser.close()
 
         return {
             "ok":
                 (
-                    course_result[
-                        "found"
-                    ]
+                    result
                     and
-                    course_result[
+                    result.get(
                         "status"
-                    ] ==
-                    200
+                    ) ==
+                    "SUCCESS"
                 ),
 
             "subject":
@@ -3082,8 +2901,5 @@ async def diagnose_asu_api(
                 term,
 
             "course_api":
-                course_result,
-
-            "requests":
-                captured_requests,
+                result,
         }
