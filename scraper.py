@@ -30,8 +30,8 @@ COURSE_RESPONSE_TIMEOUT = 35
 
 PAGE_NAVIGATION_TIMEOUT = 60000
 
-COURSE_DELAY_MIN = 0.75
-COURSE_DELAY_MAX = 1.75
+COURSE_DELAY_MIN = 0.25
+COURSE_DELAY_MAX = 0.75
 
 
 # ============================================================
@@ -50,6 +50,31 @@ COURSE_DELAY_MAX = 1.75
 # K = Update
 # L = Previous enrollment capacity
 # M = Enroll Desc
+#
+#
+# IMPORTANT LOGIC
+#
+# G Previous Amount
+#     = previous day's J Current
+#
+# H Enroll Cap
+#     = today's ASU enrollment capacity
+#
+# I Open Seats
+#     = today's H - J
+#
+# J Current
+#     = today's actual student enrollment
+#
+# K Update
+#     = today's J - previous day's J
+#
+# L Previous enrollment capacity
+#     = previous day's H Enroll Cap
+#
+# M Enroll Desc
+#     = today's H - previous day's H
+#
 # ============================================================
 
 COL_SUBJECT = 0
@@ -131,7 +156,7 @@ def get_google_credentials():
         return credentials
 
     # --------------------------------------------------------
-    # GOOGLE CLOUD / LOCAL ADC FALLBACK
+    # GOOGLE CLOUD / LOCAL ADC
     # --------------------------------------------------------
 
     credentials, project = (
@@ -428,11 +453,15 @@ def get_previous_run_sheet(
 # ============================================================
 # PREVIOUS DAY LOOKUP
 #
+# This is the historical chain.
+#
 # TODAY G Previous Amount
 # = PREVIOUS DAY J Current
 #
 # TODAY L Previous enrollment capacity
 # = PREVIOUS DAY H Enroll Cap
+#
+# We DO NOT copy yesterday's G or L.
 # ============================================================
 
 def build_previous_lookup(
@@ -476,6 +505,12 @@ def build_previous_lookup(
 
             continue
 
+        # ----------------------------------------------------
+        # PREVIOUS DAY'S ACTUAL STUDENT ENROLLMENT
+        #
+        # Previous sheet J
+        # ----------------------------------------------------
+
         previous_current = (
             row[
                 COL_CURRENT
@@ -485,6 +520,12 @@ def build_previous_lookup(
             else ""
         )
 
+        # ----------------------------------------------------
+        # PREVIOUS DAY'S ACTUAL CAPACITY
+        #
+        # Previous sheet H
+        # ----------------------------------------------------
+
         previous_cap = (
             row[
                 COL_ENROLL_CAP
@@ -493,6 +534,10 @@ def build_previous_lookup(
             COL_ENROLL_CAP
             else ""
         )
+
+        # ----------------------------------------------------
+        # PREVIOUS OPEN SEATS
+        # ----------------------------------------------------
 
         previous_open = (
             row[
@@ -535,20 +580,29 @@ def build_previous_lookup(
                     previous_first
                 ).strip(),
 
-            # Yesterday Current
-            # -> Today Previous Amount
+            # -----------------------------------------------
+            # TODAY G
+            #
+            # Yesterday J Current
+            # -----------------------------------------------
+
             "previous_amount":
                 str(
                     previous_current
                 ).strip(),
 
-            # Yesterday Enroll Cap
-            # -> Today Previous enrollment capacity
+            # -----------------------------------------------
+            # TODAY L
+            #
+            # Yesterday H Enroll Cap
+            # -----------------------------------------------
+
             "previous_capacity":
                 str(
                     previous_cap
                 ).strip(),
 
+            # Used for changed/unchanged comparison.
             "cap":
                 str(
                     previous_cap
@@ -575,7 +629,7 @@ def build_previous_lookup(
 
 
 # ============================================================
-# CURRENT EA LOOKUPS
+# CURRENT EA LOOKUP
 # ============================================================
 
 def build_daily_lookup(
@@ -618,19 +672,16 @@ def build_daily_lookup(
             else ""
         )
 
-        class_num = (
-            str(
-                row[
-                    COL_CLASS_NUM
-                ]
-            ).strip()
-        )
+        class_num = str(
+            row[
+                COL_CLASS_NUM
+            ]
+        ).strip()
 
         if not class_num:
 
             continue
 
-        # Keep the first occurrence of a Class Num.
         if class_num in lookup:
 
             print(
@@ -663,14 +714,6 @@ def build_daily_lookup(
 
 # ============================================================
 # BUILD COURSE GROUPS
-#
-# Example:
-#
-# {
-#   ("PHY", "111"): {"65830", "61059", ...},
-#   ("PHY", "113"): {...},
-#   ("PHS", "110"): {...}
-# }
 # ============================================================
 
 def build_course_groups(
@@ -723,16 +766,32 @@ def build_course_groups(
             class_num
         )
 
+    # --------------------------------------------------------
+    # PROCESS LARGEST GROUPS FIRST
+    #
+    # If Render is interrupted, high-value batches have
+    # already been completed.
+    # --------------------------------------------------------
+
+    sorted_groups = dict(
+        sorted(
+            groups.items(),
+            key=lambda item:
+                len(
+                    item[1]
+                ),
+            reverse=True,
+        )
+    )
+
     return (
-        dict(
-            groups
-        ),
+        sorted_groups,
         invalid_classes,
     )
 
 
 # ============================================================
-# INTEGER / DIFFERENCE
+# DIFFERENCE
 # ============================================================
 
 def calculate_difference(
@@ -781,21 +840,23 @@ def calculate_difference(
 
 
 # ============================================================
-# ENROLLMENT DESCRIPTION
+# CHANGE DESCRIPTION
+#
+# Used for CAPACITY CHANGE in column M.
 # ============================================================
 
-def build_enrollment_description(
-    update,
+def build_change_description(
+    difference,
 ):
 
-    if update == "":
+    if difference == "":
 
         return ""
 
     try:
 
         amount = int(
-            update
+            difference
         )
 
     except (
@@ -822,7 +883,7 @@ def build_enrollment_description(
 
 
 # ============================================================
-# EXTRACT INSTRUCTOR
+# INSTRUCTOR
 # ============================================================
 
 def extract_instructor(
@@ -872,7 +933,6 @@ def extract_instructor(
             "~"
         )[0].strip()
 
-    # ASU sometimes returns Staff.
     if (
         first_name.lower() ==
         "staff"
@@ -894,7 +954,14 @@ def extract_instructor(
 
 
 # ============================================================
-# SIMPLIFY ONE ASU CLASS OBJECT
+# SIMPLIFY ASU CLASS
+#
+# IMPORTANT:
+#
+# ENRL_CAP = class capacity
+# ENRL_TOT = students actually enrolled
+#
+# Open Seats = ENRL_CAP - ENRL_TOT
 # ============================================================
 
 def simplify_asu_class(
@@ -933,6 +1000,10 @@ def simplify_asu_class(
 
         return None
 
+    # ========================================================
+    # SEAT DATA
+    # ========================================================
+
     seat_info = (
         item.get(
             "seatInfo",
@@ -948,75 +1019,94 @@ def simplify_asu_class(
         seat_info = {}
 
     # --------------------------------------------------------
-    # CAPACITY
+    # ENROLLMENT CAPACITY
     # --------------------------------------------------------
 
-    enroll_cap = (
+    enrollment_capacity = (
         seat_info.get(
             "ENRL_CAP"
         )
     )
 
-    if enroll_cap is None:
+    if enrollment_capacity is None:
 
-        enroll_cap = (
+        enrollment_capacity = (
             clas.get(
                 "ENRLCAP"
             )
         )
 
     # --------------------------------------------------------
-    # CURRENT ENROLLMENT
+    # ACTUAL STUDENT ENROLLMENT
     # --------------------------------------------------------
 
-    enroll_total = (
+    enrollment_total = (
         seat_info.get(
             "ENRL_TOT"
         )
     )
 
-    if enroll_total is None:
+    if enrollment_total is None:
 
-        enroll_total = (
+        enrollment_total = (
             clas.get(
                 "ENRLTOT"
             )
         )
 
     # --------------------------------------------------------
-    # OPEN SEATS
+    # NORMALIZE
     # --------------------------------------------------------
-
-    open_seats = None
 
     try:
 
-        if (
-            enroll_cap is not None
-            and
-            enroll_total is not None
-        ):
-
-            open_seats = (
-                int(
-                    enroll_cap
-                )
-                -
-                int(
-                    enroll_total
-                )
-            )
+        enrollment_capacity = int(
+            enrollment_capacity
+        )
 
     except (
         TypeError,
         ValueError,
     ):
 
-        open_seats = None
+        enrollment_capacity = None
+
+    try:
+
+        enrollment_total = int(
+            enrollment_total
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        enrollment_total = None
 
     # --------------------------------------------------------
-    # INSTRUCTOR
+    # OPEN SEATS
     # --------------------------------------------------------
+
+    if (
+        enrollment_capacity is not None
+        and
+        enrollment_total is not None
+    ):
+
+        open_seats = (
+            enrollment_capacity
+            -
+            enrollment_total
+        )
+
+    else:
+
+        open_seats = None
+
+    # ========================================================
+    # INSTRUCTOR
+    # ========================================================
 
     (
         instructor_last,
@@ -1024,6 +1114,10 @@ def simplify_asu_class(
     ) = extract_instructor(
         clas
     )
+
+    # ========================================================
+    # RETURN
+    # ========================================================
 
     return {
 
@@ -1084,37 +1178,43 @@ def simplify_asu_class(
         "instructor_first":
             instructor_first,
 
-        "cap":
+        # ----------------------------------------------------
+        # H Enroll Cap
+        # ----------------------------------------------------
+
+        "enroll_cap":
             (
                 ""
-                if enroll_cap is None
-                else str(
-                    enroll_cap
-                )
+                if enrollment_capacity is None
+                else enrollment_capacity
             ),
 
-        "current":
-            (
-                ""
-                if enroll_total is None
-                else str(
-                    enroll_total
-                )
-            ),
+        # ----------------------------------------------------
+        # I Open Seats
+        # ----------------------------------------------------
 
-        "open":
+        "open_seats":
             (
                 ""
                 if open_seats is None
-                else str(
-                    open_seats
-                )
+                else open_seats
+            ),
+
+        # ----------------------------------------------------
+        # J Current
+        # ----------------------------------------------------
+
+        "enrollment_total":
+            (
+                ""
+                if enrollment_total is None
+                else enrollment_total
             ),
     }
 
 
 # ============================================================
-# COURSE SEARCH URL
+# SEARCH URLS
 # ============================================================
 
 def build_course_search_url(
@@ -1137,10 +1237,6 @@ def build_course_search_url(
     )
 
 
-# ============================================================
-# INDIVIDUAL FALLBACK URL
-# ============================================================
-
 def build_class_search_url(
     class_num,
     term,
@@ -1160,14 +1256,12 @@ def build_class_search_url(
 
 
 # ============================================================
-# WAIT FOR ASU'S OWN /search/classes RESPONSE
+# CAPTURE ASU'S OWN AUTHENTICATED RESPONSE
 #
-# IMPORTANT:
+# We do NOT create a direct request to ASU's API.
 #
-# We do NOT call the ASU API ourselves.
-#
-# The ASU Class Search frontend makes its own authenticated
-# /search/classes request. We intercept that response.
+# ASU Class Search sends the authenticated request itself.
+# We listen for the /search/classes response and read its JSON.
 # ============================================================
 
 async def capture_search_response(
@@ -1217,6 +1311,7 @@ async def capture_search_response(
             ):
 
                 response_future.set_result({
+
                     "ok":
                         False,
 
@@ -1241,6 +1336,7 @@ async def capture_search_response(
             )
 
             response_future.set_result({
+
                 "ok":
                     True,
 
@@ -1259,6 +1355,7 @@ async def capture_search_response(
             if not response_future.done():
 
                 response_future.set_result({
+
                     "ok":
                         False,
 
@@ -1294,17 +1391,15 @@ async def capture_search_response(
 
         except PlaywrightTimeoutError:
 
-            # The API response may still arrive even when
-            # the full page navigation exceeds the timeout.
             print(
-                "Page navigation timed out; "
-                "continuing to wait for "
-                "ASU classes API response."
+                "Navigation timed out; "
+                "waiting for ASU API "
+                "response anyway."
             )
 
         try:
 
-            result = (
+            return (
                 await asyncio.wait_for(
                     response_future,
                     timeout=
@@ -1312,11 +1407,10 @@ async def capture_search_response(
                 )
             )
 
-            return result
-
         except asyncio.TimeoutError:
 
             return {
+
                 "ok":
                     False,
 
@@ -1329,7 +1423,8 @@ async def capture_search_response(
                 "error":
                     (
                         "Timed out waiting for "
-                        "ASU /search/classes response."
+                        "ASU /search/classes "
+                        "response."
                     ),
             }
 
@@ -1348,7 +1443,7 @@ async def capture_search_response(
 
 
 # ============================================================
-# SCRAPE ONE COURSE
+# COURSE SEARCH
 # ============================================================
 
 async def scrape_course_once(
@@ -1403,6 +1498,7 @@ async def scrape_course_once(
     ):
 
         return {
+
             "status":
                 "ERROR",
 
@@ -1495,6 +1591,7 @@ async def scrape_course_once(
     )
 
     return {
+
         "status":
             "SUCCESS",
 
@@ -1591,7 +1688,6 @@ async def scrape_course(
 
         print(
             f"{subject} {catalog_num}: "
-            f"{result.get('error_type')} - "
             f"retrying in "
             f"{delay:.1f}s..."
         )
@@ -1604,10 +1700,14 @@ async def scrape_course(
 
 
 # ============================================================
-# INDIVIDUAL CLASS FALLBACK
+# INDIVIDUAL CLASS SEARCH
 #
-# This still uses ASU's structured API response.
-# It does NOT parse rendered HTML.
+# Used for:
+#
+# 1. Singleton course groups
+# 2. Missing classes from course responses
+#
+# Still captures ASU's structured API response.
 # ============================================================
 
 async def scrape_individual_class(
@@ -1690,7 +1790,7 @@ async def scrape_individual_class(
 
 
 # ============================================================
-# PREPARE EA ROW UPDATE
+# PREPARE EA ROW
 # ============================================================
 
 def prepare_row_update(
@@ -1709,6 +1809,7 @@ def prepare_row_update(
     if not daily:
 
         return {
+
             "status":
                 "ERROR",
 
@@ -1744,27 +1845,30 @@ def prepare_row_update(
         )
     )
 
-    # --------------------------------------------------------
-    # TODAY
-    # --------------------------------------------------------
+    # ========================================================
+    # TODAY'S ACTUAL ASU VALUES
+    # ========================================================
 
-    today_cap = str(
+    # H
+    today_enroll_cap = str(
         scraped.get(
-            "cap",
+            "enroll_cap",
             "",
         )
     ).strip()
 
-    today_open = str(
+    # I
+    today_open_seats = str(
         scraped.get(
-            "open",
+            "open_seats",
             "",
         )
     ).strip()
 
-    today_current = str(
+    # J
+    today_enrollment_total = str(
         scraped.get(
-            "current",
+            "enrollment_total",
             "",
         )
     ).strip()
@@ -1783,10 +1887,12 @@ def prepare_row_update(
         )
     ).strip()
 
-    # --------------------------------------------------------
-    # PREVIOUS
-    # --------------------------------------------------------
+    # ========================================================
+    # PREVIOUS DAY
+    # ========================================================
 
+    # G
+    # Previous day's J Current
     previous_amount = str(
         previous.get(
             "previous_amount",
@@ -1794,6 +1900,8 @@ def prepare_row_update(
         )
     ).strip()
 
+    # L
+    # Previous day's H Enroll Cap
     previous_capacity = str(
         previous.get(
             "previous_capacity",
@@ -1801,9 +1909,9 @@ def prepare_row_update(
         )
     ).strip()
 
-    # --------------------------------------------------------
+    # ========================================================
     # INSTRUCTOR FALLBACK
-    # --------------------------------------------------------
+    # ========================================================
 
     if not last_name:
 
@@ -1837,26 +1945,58 @@ def prepare_row_update(
             )
         ).strip()
 
-    # --------------------------------------------------------
-    # ENROLLMENT UPDATE
-    # --------------------------------------------------------
+    # ========================================================
+    # K UPDATE
+    #
+    # STUDENT ENROLLMENT CHANGE
+    #
+    # Today's Current
+    # -
+    # Previous day's Current
+    # ========================================================
 
     enrollment_update = (
         calculate_difference(
-            today_current,
+            today_enrollment_total,
             previous_amount,
         )
     )
 
-    enrollment_description = (
-        build_enrollment_description(
-            enrollment_update
+    # ========================================================
+    # CAPACITY CHANGE
+    #
+    # Today's Enroll Cap
+    # -
+    # Previous day's Enroll Cap
+    #
+    # Used ONLY to generate column M.
+    # ========================================================
+
+    capacity_update = (
+        calculate_difference(
+            today_enroll_cap,
+            previous_capacity,
         )
     )
 
-    # --------------------------------------------------------
-    # CHANGED
-    # --------------------------------------------------------
+    # ========================================================
+    # M ENROLL DESC
+    #
+    # Describes CAPACITY change.
+    # ========================================================
+
+    enrollment_description = (
+        build_change_description(
+            capacity_update
+        )
+    )
+
+    # ========================================================
+    # CHANGED / UNCHANGED
+    #
+    # Job-level changed status considers any actual
+    # enrollment/capacity/open-seat/instructor difference.
+    # ========================================================
 
     has_previous = bool(
         previous
@@ -1867,30 +2007,37 @@ def prepare_row_update(
     if has_previous:
 
         changed = (
-            today_cap !=
+
+            today_enroll_cap !=
             str(
                 previous.get(
                     "cap",
                     "",
                 )
             ).strip()
+
             or
-            today_open !=
+
+            today_open_seats !=
             str(
                 previous.get(
                     "open",
                     "",
                 )
             ).strip()
+
             or
-            today_current !=
+
+            today_enrollment_total !=
             str(
                 previous.get(
                     "current",
                     "",
                 )
             ).strip()
+
             or
+
             last_name !=
             str(
                 previous.get(
@@ -1898,7 +2045,9 @@ def prepare_row_update(
                     "",
                 )
             ).strip()
+
             or
+
             first_name !=
             str(
                 previous.get(
@@ -1908,9 +2057,33 @@ def prepare_row_update(
             ).strip()
         )
 
-    # --------------------------------------------------------
-    # E:M
-    # --------------------------------------------------------
+    # ========================================================
+    # WRITE E:M
+    #
+    # E Instructor Last Name
+    # F Instructor First Name
+    #
+    # G Previous Amount
+    #   = yesterday Current
+    #
+    # H Enroll Cap
+    #   = today capacity
+    #
+    # I Open Seats
+    #   = today capacity - today enrollment
+    #
+    # J Current
+    #   = today actual enrollment
+    #
+    # K Update
+    #   = today enrollment - yesterday enrollment
+    #
+    # L Previous enrollment capacity
+    #   = yesterday capacity
+    #
+    # M Enroll Desc
+    #   = description of capacity change
+    # ========================================================
 
     values = [
 
@@ -1920,29 +2093,30 @@ def prepare_row_update(
         # F
         first_name,
 
-        # G Previous Amount
+        # G
         previous_amount,
 
-        # H Enroll Cap
-        today_cap,
+        # H
+        today_enroll_cap,
 
-        # I Open Seats
-        today_open,
+        # I
+        today_open_seats,
 
-        # J Current
-        today_current,
+        # J
+        today_enrollment_total,
 
-        # K Update
+        # K
         enrollment_update,
 
-        # L Previous enrollment capacity
+        # L
         previous_capacity,
 
-        # M Enroll Desc
+        # M
         enrollment_description,
     ]
 
     return {
+
         "status":
             "SUCCESS",
 
@@ -1966,14 +2140,20 @@ def prepare_row_update(
 
         "has_previous":
             has_previous,
+
+        "enrollment_update":
+            enrollment_update,
+
+        "capacity_update":
+            capacity_update,
     }
 
 
 # ============================================================
-# WRITE ONE COURSE'S RESULTS
+# WRITE RESULTS
 # ============================================================
 
-def write_course_results(
+def write_results(
     sheet,
     class_results,
     daily_lookup,
@@ -2015,6 +2195,7 @@ def write_course_results(
             continue
 
         updates.append({
+
             "range":
                 prepared[
                     "range"
@@ -2046,10 +2227,11 @@ def write_course_results(
                 sheet.batch_update(
                     updates
                 ),
-            "Write course enrollment data",
+            "Write enrollment data",
         )
 
     return {
+
         "results":
             results,
 
@@ -2063,6 +2245,19 @@ def write_course_results(
 
 # ============================================================
 # MAIN
+#
+# HYBRID STRATEGY
+#
+# 1 required class:
+#     direct Class Num search
+#
+# 2+ required classes:
+#     one course search
+#
+# Missing from course response:
+#     individual Class Num fallback
+#
+# Groups are sorted largest first.
 # ============================================================
 
 async def main(
@@ -2111,10 +2306,11 @@ async def main(
         )
     )
 
-    course_groups, invalid_classes = (
-        build_course_groups(
-            daily_lookup
-        )
+    (
+        course_groups,
+        invalid_classes,
+    ) = build_course_groups(
+        daily_lookup
     )
 
     total_classes = (
@@ -2134,7 +2330,7 @@ async def main(
     )
 
     print(
-        "COURSE-LEVEL ENROLLMENT SCRAPER"
+        "HYBRID ENROLLMENT SCRAPER"
     )
 
     print(
@@ -2160,16 +2356,14 @@ async def main(
         "========================================"
     )
 
-    if invalid_classes:
-
-        print(
-            "Classes missing Subject/Catalog Num:",
-            invalid_classes,
-        )
+    # ========================================================
+    # PROGRESS START
+    # ========================================================
 
     if progress_callback:
 
         progress_callback({
+
             "type":
                 "start",
 
@@ -2209,19 +2403,20 @@ async def main(
     # ========================================================
 
     processed = 0
+
     successful = 0
 
     total_changed = 0
+
     total_unchanged = 0
 
     total_errors = 0
+
     total_needs_review = 0
 
     error_classes = []
-    no_data_classes = []
 
-    # Classes we've successfully found.
-    found_classes = set()
+    no_data_classes = []
 
     # ========================================================
     # PLAYWRIGHT
@@ -2249,11 +2444,11 @@ async def main(
         try:
 
             # =================================================
-            # COURSE LOOP
+            # GROUP LOOP
             # =================================================
 
             for (
-                course_index,
+                group_index,
                 (
                     course_key,
                     wanted_class_nums,
@@ -2268,13 +2463,22 @@ async def main(
                     catalog_num,
                 ) = course_key
 
+                wanted_class_nums = set(
+                    wanted_class_nums
+                )
+
+                group_size = len(
+                    wanted_class_nums
+                )
+
                 # --------------------------------------------
-                # CANCELLATION CHECK
+                # CHECKPOINT
                 # --------------------------------------------
 
                 if progress_callback:
 
                     progress_callback({
+
                         "type":
                             "checkpoint",
 
@@ -2293,117 +2497,79 @@ async def main(
                             total_classes,
                     })
 
-                # --------------------------------------------
-                # COURSE
-                # --------------------------------------------
-
                 print(
                     "\n----------------------------------------"
                 )
 
                 print(
-                    f"Course "
-                    f"{course_index}/"
+                    f"Group "
+                    f"{group_index}/"
                     f"{total_courses}: "
                     f"{subject} "
                     f"{catalog_num}"
                 )
 
                 print(
-                    "Required Class Nums:",
+                    "Required:",
                     sorted(
                         wanted_class_nums
                     ),
                 )
 
-                if progress_callback:
+                matched = {}
 
-                    progress_callback({
-                        "type":
-                            "batch_start",
-
-                        "message":
-                            (
-                                f"Loading "
-                                f"{subject} "
-                                f"{catalog_num} "
-                                f"({course_index}/"
-                                f"{total_courses})."
-                            ),
-
-                        "processed":
-                            processed,
-
-                        "total":
-                            total_classes,
-                    })
-
-                course_result = (
-                    await scrape_course(
-                        page,
-                        subject,
-                        catalog_num,
-                        term,
-                    )
-                )
-
-                # --------------------------------------------
-                # COURSE FAILURE
-                # --------------------------------------------
+                # =================================================
+                # SINGLETON
+                #
+                # Only one EA class from this course.
+                # Search directly by Class Num.
+                # =================================================
 
                 if (
-                    not course_result
-                    or
-                    course_result.get(
-                        "status"
-                    ) !=
-                    "SUCCESS"
+                    group_size ==
+                    1
                 ):
+
+                    class_num = next(
+                        iter(
+                            wanted_class_nums
+                        )
+                    )
 
                     print(
                         f"{subject} "
                         f"{catalog_num}: "
-                        "course search failed."
+                        "singleton -> "
+                        f"direct class search "
+                        f"{class_num}"
                     )
 
-                    # We will individually retry all required
-                    # classes from this course below.
-                    returned_lookup = {}
+                    if progress_callback:
 
-                else:
+                        progress_callback({
 
-                    returned_lookup = {
-                        item[
-                            "class_num"
-                        ]:
-                            item
+                            "type":
+                                "batch_start",
 
-                        for item
-                        in course_result.get(
-                            "classes",
-                            []
-                        )
+                            "message":
+                                (
+                                    f"Loading class "
+                                    f"{class_num}."
+                                ),
 
-                        if item.get(
-                            "class_num"
-                        )
-                    }
+                            "processed":
+                                processed,
 
-                # --------------------------------------------
-                # FILTER TO EA CLASS NUMS ONLY
-                # --------------------------------------------
-
-                matched = {}
-
-                missing = []
-
-                for class_num in (
-                    wanted_class_nums
-                ):
+                            "total":
+                                total_classes,
+                        })
 
                     scraped = (
-                        returned_lookup.get(
-                            class_num
+                        await
+                        scrape_individual_class(
+                            page,
+                            class_num,
+                            term,
                         )
                     )
 
@@ -2413,67 +2579,155 @@ async def main(
                             class_num
                         ] = scraped
 
-                        found_classes.add(
-                            class_num
-                        )
-
                     else:
 
-                        missing.append(
-                            class_num
-                        )
+                        total_errors += 1
 
-                print(
-                    f"{subject} "
-                    f"{catalog_num}: "
-                    f"matched "
-                    f"{len(matched)}/"
-                    f"{len(wanted_class_nums)} "
-                    "required classes."
-                )
+                        error_classes.append({
+
+                            "class_num":
+                                class_num,
+
+                            "error_type":
+                                "CLASS_NOT_RETURNED",
+
+                            "error":
+                                (
+                                    "ASU did not return "
+                                    "the requested class."
+                                ),
+                        })
 
                 # =================================================
-                # INDIVIDUAL FALLBACK FOR MISSING CLASSES
+                # COURSE BATCH
+                #
+                # Two or more EA classes.
                 # =================================================
 
-                if missing:
+                else:
 
                     print(
-                        "Missing from course response:",
-                        missing,
+                        f"{subject} "
+                        f"{catalog_num}: "
+                        f"course batch for "
+                        f"{group_size} "
+                        "required classes."
                     )
+
+                    if progress_callback:
+
+                        progress_callback({
+
+                            "type":
+                                "batch_start",
+
+                            "message":
+                                (
+                                    f"Loading "
+                                    f"{subject} "
+                                    f"{catalog_num} "
+                                    f"for "
+                                    f"{group_size} "
+                                    "required classes."
+                                ),
+
+                            "processed":
+                                processed,
+
+                            "total":
+                                total_classes,
+                        })
+
+                    course_result = (
+                        await scrape_course(
+                            page,
+                            subject,
+                            catalog_num,
+                            term,
+                        )
+                    )
+
+                    returned_lookup = {}
+
+                    if (
+                        course_result
+                        and
+                        course_result.get(
+                            "status"
+                        ) ==
+                        "SUCCESS"
+                    ):
+
+                        returned_lookup = {
+
+                            item[
+                                "class_num"
+                            ]:
+                                item
+
+                            for item
+                            in course_result.get(
+                                "classes",
+                                []
+                            )
+
+                            if item.get(
+                                "class_num"
+                            )
+                        }
+
+                    # -----------------------------------------
+                    # MATCH ONLY EA CLASS NUMS
+                    # -----------------------------------------
+
+                    missing = []
+
+                    for class_num in (
+                        wanted_class_nums
+                    ):
+
+                        scraped = (
+                            returned_lookup.get(
+                                class_num
+                            )
+                        )
+
+                        if scraped:
+
+                            matched[
+                                class_num
+                            ] = scraped
+
+                        else:
+
+                            missing.append(
+                                class_num
+                            )
+
+                    print(
+                        f"{subject} "
+                        f"{catalog_num}: "
+                        f"matched "
+                        f"{len(matched)}/"
+                        f"{group_size} "
+                        "required classes."
+                    )
+
+                    # =========================================
+                    # FALLBACK
+                    # =========================================
 
                     for class_num in (
                         missing
                     ):
 
-                        if progress_callback:
-
-                            progress_callback({
-                                "type":
-                                    "checkpoint",
-
-                                "message":
-                                    (
-                                        "Checking job status "
-                                        "before fallback "
-                                        f"{class_num}."
-                                    ),
-
-                                "processed":
-                                    processed,
-
-                                "total":
-                                    total_classes,
-                            })
-
                         print(
                             f"{class_num}: "
-                            "running individual "
-                            "API-response fallback."
+                            "course response miss -> "
+                            "direct class fallback."
                         )
 
-                        fallback = (
+                        scraped = (
                             await
                             scrape_individual_class(
                                 page,
@@ -2482,21 +2736,18 @@ async def main(
                             )
                         )
 
-                        if fallback:
+                        if scraped:
 
                             matched[
                                 class_num
-                            ] = fallback
-
-                            found_classes.add(
-                                class_num
-                            )
+                            ] = scraped
 
                         else:
 
                             total_errors += 1
 
-                            error_info = {
+                            error_classes.append({
+
                                 "class_num":
                                     class_num,
 
@@ -2506,21 +2757,17 @@ async def main(
                                 "error":
                                     (
                                         "Class was not returned "
-                                        "by its course search or "
-                                        "individual fallback."
+                                        "by course search or "
+                                        "direct fallback."
                                     ),
-                            }
-
-                            error_classes.append(
-                                error_info
-                            )
+                            })
 
                 # =================================================
-                # WRITE MATCHED COURSE RESULTS
+                # WRITE GROUP
                 # =================================================
 
                 write_summary = (
-                    write_course_results(
+                    write_results(
                         sheet,
                         matched,
                         daily_lookup,
@@ -2528,20 +2775,18 @@ async def main(
                     )
                 )
 
-                course_successful = (
+                group_successful = (
                     len(
                         matched
                     )
                 )
 
                 successful += (
-                    course_successful
+                    group_successful
                 )
 
                 processed += (
-                    len(
-                        wanted_class_nums
-                    )
+                    group_size
                 )
 
                 total_changed += (
@@ -2556,9 +2801,9 @@ async def main(
                     ]
                 )
 
-                # --------------------------------------------
-                # PROGRESS RESULT OBJECTS
-                # --------------------------------------------
+                # =================================================
+                # CALLBACK RESULTS
+                # =================================================
 
                 callback_results = []
 
@@ -2572,6 +2817,7 @@ async def main(
                     ):
 
                         callback_results.append({
+
                             "class_num":
                                 class_num,
 
@@ -2582,6 +2828,7 @@ async def main(
                     else:
 
                         callback_results.append({
+
                             "class_num":
                                 class_num,
 
@@ -2595,6 +2842,7 @@ async def main(
                 if progress_callback:
 
                     progress_callback({
+
                         "type":
                             "batch_complete",
 
@@ -2640,12 +2888,12 @@ async def main(
                             callback_results,
                     })
 
-                # --------------------------------------------
+                # =================================================
                 # SMALL DELAY
-                # --------------------------------------------
+                # =================================================
 
                 if (
-                    course_index <
+                    group_index <
                     total_courses
                 ):
 
@@ -2665,7 +2913,7 @@ async def main(
             await browser.close()
 
     # ========================================================
-    # INVALID EA ROWS
+    # INVALID EA CLASSES
     # ========================================================
 
     for class_num in (
@@ -2675,6 +2923,7 @@ async def main(
         total_errors += 1
 
         error_classes.append({
+
             "class_num":
                 class_num,
 
@@ -2689,7 +2938,7 @@ async def main(
         })
 
     # ========================================================
-    # FINAL
+    # FINAL SUMMARY
     # ========================================================
 
     print(
@@ -2734,9 +2983,14 @@ async def main(
         "========================================"
     )
 
+    # ========================================================
+    # FINAL CALLBACK
+    # ========================================================
+
     if progress_callback:
 
         progress_callback({
+
             "type":
                 "complete",
 
@@ -2765,7 +3019,12 @@ async def main(
                 total_needs_review,
         })
 
+    # ========================================================
+    # RETURN
+    # ========================================================
+
     return {
+
         "status":
             "success",
 
@@ -2829,9 +3088,7 @@ def run_enrollment(
 
 
 # ============================================================
-# OPTIONAL DIAGNOSTIC
-#
-# Keeps /diagnose-asu working while we test the new scraper.
+# DIAGNOSTIC
 # ============================================================
 
 async def diagnose_asu_api(
@@ -2875,6 +3132,7 @@ async def diagnose_asu_api(
             await browser.close()
 
         return {
+
             "ok":
                 (
                     result
