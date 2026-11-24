@@ -1,0 +1,24 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
+from scraper import run_enrollment
+
+app = FastAPI()
+
+class RunRequest(BaseModel):
+    sheet_url: str
+    sheet_name: str
+    term: str
+    concurrency: int = 5
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.post("/run")
+def run(req: RunRequest):
+    return run_enrollment(
+        sheet_url=req.sheet_url,
+        sheet_name=req.sheet_name,
+        term=req.term,
+        concurrency=req.concurrency
+    )
