@@ -1887,11 +1887,9 @@ def diagnose_asu():
 
     import asyncio
 
-    result = asyncio.run(
+    return asyncio.run(
         diagnose_asu_api(
-            class_num="65830",
+            subject="PHY",
             term="2267",
         )
     )
-
-    return result

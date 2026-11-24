@@ -2445,15 +2445,11 @@ def run_enrollment(
     )
 
 async def diagnose_asu_api(
-    class_num,
-    term,
+    subject="PHY",
+    term="2267",
 ):
 
     async with async_playwright() as p:
-
-        # ====================================================
-        # START BROWSER
-        # ====================================================
 
         browser = await p.chromium.launch(
             headless=True,
@@ -2464,13 +2460,9 @@ async def diagnose_asu_api(
             ],
         )
 
-        context = (
-            await browser.new_context()
-        )
+        context = await browser.new_context()
 
-        page = (
-            await context.new_page()
-        )
+        page = await context.new_page()
 
         # ====================================================
         # CAPTURED DATA
@@ -2478,7 +2470,15 @@ async def diagnose_asu_api(
 
         captured_requests = []
 
-        class_api_responses = []
+        bulk_response = {
+            "found": False,
+            "status": None,
+            "url": None,
+            "total": None,
+            "returned": 0,
+            "scroll_id": None,
+            "classes": [],
+        }
 
         # ====================================================
         # REQUEST HANDLER
@@ -2496,68 +2496,6 @@ async def diagnose_asu_api(
             ):
                 return
 
-            print(
-                "\n"
-                "========== ASU API REQUEST =========="
-            )
-
-            print(
-                "METHOD:",
-                request.method,
-            )
-
-            print(
-                "URL:",
-                url,
-            )
-
-            # ------------------------------------------------
-            # SAFE HEADERS
-            # ------------------------------------------------
-
-            try:
-
-                headers = (
-                    await request
-                    .all_headers()
-                )
-
-            except Exception:
-
-                headers = {}
-
-            safe_headers = {}
-
-            for key, value in (
-                headers.items()
-            ):
-
-                key_lower = (
-                    key.lower()
-                )
-
-                # Never print auth/session credentials.
-                if key_lower in [
-                    "authorization",
-                    "cookie",
-                    "set-cookie",
-                ]:
-
-                    safe_headers[
-                        key
-                    ] = "[REDACTED]"
-
-                else:
-
-                    safe_headers[
-                        key
-                    ] = value
-
-            print(
-                "HEADERS:",
-                safe_headers,
-            )
-
             captured_requests.append({
                 "method":
                     request.method,
@@ -2566,353 +2504,32 @@ async def diagnose_asu_api(
                     url,
             })
 
-        # ====================================================
-        # RESPONSE HANDLER
-        # ====================================================
-
-        async def handle_response(
-            response,
-        ):
-
-            url = (
-                response.url
-            )
-
-            if (
-                "catalog-microservices"
-                not in url
-            ):
-                return
-
             print(
-                "\n"
-                "========== ASU API RESPONSE =========="
-            )
-
-            print(
-                "STATUS:",
-                response.status,
-            )
-
-            print(
-                "URL:",
+                "ASU API REQUEST:",
+                request.method,
                 url,
             )
-
-            # ------------------------------------------------
-            # RESPONSE HEADERS
-            # ------------------------------------------------
-
-            try:
-
-                headers = (
-                    await response
-                    .all_headers()
-                )
-
-            except Exception:
-
-                headers = {}
-
-            content_type = (
-                headers.get(
-                    "content-type",
-                    "",
-                )
-            )
-
-            print(
-                "CONTENT TYPE:",
-                content_type,
-            )
-
-            # ------------------------------------------------
-            # WE ONLY CARE ABOUT /search/classes
-            # ------------------------------------------------
-
-            if (
-                "/search/classes"
-                not in url
-            ):
-                return
-
-            # ------------------------------------------------
-            # PARSE JSON
-            # ------------------------------------------------
-
-            try:
-
-                data = (
-                    await response.json()
-                )
-
-            except Exception as e:
-
-                print(
-                    "FAILED TO PARSE "
-                    "CLASS API JSON:",
-                    type(e).__name__,
-                    str(e),
-                )
-
-                class_api_responses.append({
-                    "url":
-                        url,
-
-                    "status":
-                        response.status,
-
-                    "error":
-                        (
-                            f"{type(e).__name__}: "
-                            f"{e}"
-                        ),
-                })
-
-                return
-
-            # ------------------------------------------------
-            # STORE COMPLETE RESPONSE
-            # ------------------------------------------------
-
-            class_api_responses.append({
-                "url":
-                    url,
-
-                "status":
-                    response.status,
-
-                "data":
-                    data,
-            })
-
-            # =================================================
-            # DIAGNOSTIC OUTPUT
-            # =================================================
-
-            print(
-                "\n"
-                "========== CLASS API DATA =========="
-            )
-
-            print(
-                "RESPONSE TYPE:",
-                type(data).__name__,
-            )
-
-            # ------------------------------------------------
-            # DICT RESPONSE
-            # ------------------------------------------------
-
-            if isinstance(
-                data,
-                dict,
-            ):
-
-                print(
-                    "TOP LEVEL KEYS:",
-                    list(
-                        data.keys()
-                    ),
-                )
-
-                # --------------------------------------------
-                # CLASSES
-                # --------------------------------------------
-
-                classes = (
-                    data.get(
-                        "classes"
-                    )
-                )
-
-                if isinstance(
-                    classes,
-                    list,
-                ):
-
-                    print(
-                        "CLASS COUNT:",
-                        len(
-                            classes
-                        ),
-                    )
-
-                    if classes:
-
-                        first = (
-                            classes[0]
-                        )
-
-                        print(
-                            "FIRST CLASS TYPE:",
-                            type(
-                                first
-                            ).__name__,
-                        )
-
-                        if isinstance(
-                            first,
-                            dict,
-                        ):
-
-                            print(
-                                "FIRST CLASS KEYS:",
-                                list(
-                                    first.keys()
-                                ),
-                            )
-
-                            # =================================
-                            # CLAS OBJECT
-                            # =================================
-
-                            clas = (
-                                first.get(
-                                    "CLAS"
-                                )
-                            )
-
-                            if isinstance(
-                                clas,
-                                dict,
-                            ):
-
-                                print(
-                                    "CLAS KEYS:",
-                                    list(
-                                        clas.keys()
-                                    ),
-                                )
-
-                                interesting = {}
-
-                                # Try several likely ASU field
-                                # names so the diagnostic tells
-                                # us exactly what is available.
-                                interesting_fields = [
-                                    "CLASSNBR",
-                                    "CLASS_NBR",
-                                    "SUBJECT",
-                                    "CATALOGNBR",
-                                    "CATALOG_NBR",
-                                    "ENRLCAP",
-                                    "ENRL_CAP",
-                                    "ENRLTOT",
-                                    "ENRL_TOT",
-                                    "ENROLLMENT_TOTAL",
-                                    "OPEN_SEATS",
-                                    "SSR_COMPONENT",
-                                    "SESSION_CODE",
-                                ]
-
-                                for field in (
-                                    interesting_fields
-                                ):
-
-                                    if field in clas:
-
-                                        interesting[
-                                            field
-                                        ] = (
-                                            clas[
-                                                field
-                                            ]
-                                        )
-
-                                print(
-                                    "INTERESTING CLAS FIELDS:",
-                                    interesting,
-                                )
-
-                            # =================================
-                            # OTHER NESTED OBJECTS
-                            # =================================
-
-                            for key, value in (
-                                first.items()
-                            ):
-
-                                if isinstance(
-                                    value,
-                                    dict,
-                                ):
-
-                                    print(
-                                        f"{key} KEYS:",
-                                        list(
-                                            value.keys()
-                                        ),
-                                    )
-
-                                elif isinstance(
-                                    value,
-                                    list,
-                                ):
-
-                                    print(
-                                        f"{key}: LIST "
-                                        f"({len(value)} items)"
-                                    )
-
-            # ------------------------------------------------
-            # LIST RESPONSE
-            # ------------------------------------------------
-
-            elif isinstance(
-                data,
-                list,
-            ):
-
-                print(
-                    "TOP LEVEL LIST LENGTH:",
-                    len(
-                        data
-                    ),
-                )
-
-                if data:
-
-                    first = (
-                        data[0]
-                    )
-
-                    if isinstance(
-                        first,
-                        dict,
-                    ):
-
-                        print(
-                            "FIRST ITEM KEYS:",
-                            list(
-                                first.keys()
-                            ),
-                        )
-
-        # ====================================================
-        # REGISTER NETWORK LISTENERS
-        # ====================================================
 
         page.on(
             "request",
             handle_request,
         )
 
-        page.on(
-            "response",
-            handle_response,
-        )
-
         # ====================================================
-        # OPEN NORMAL ASU CLASS SEARCH
+        # STEP 1
+        #
+        # Bootstrap the normal ASU application.
+        #
+        # This allows ASU's own frontend to establish whatever
+        # session/authentication state the catalog API needs.
         # ====================================================
 
-        url = (
+        bootstrap_url = (
             "https://catalog.apps.asu.edu/"
             "catalog/classes/classlist?"
             "advanced=true"
             "&campusOrOnlineSelection=A"
-            f"&classNbr={class_num}"
+            f"&subject={subject}"
             "&honors=F"
             "&promod=F"
             "&searchType=all"
@@ -2920,17 +2537,25 @@ async def diagnose_asu_api(
         )
 
         print(
-            "\nOpening ASU Class Search:"
+            "\n========================================"
         )
 
         print(
-            url
+            "BOOTSTRAPPING ASU CLASS SEARCH"
+        )
+
+        print(
+            bootstrap_url
+        )
+
+        print(
+            "========================================\n"
         )
 
         try:
 
             await page.goto(
-                url,
+                bootstrap_url,
                 timeout=60000,
                 wait_until="domcontentloaded",
             )
@@ -2938,90 +2563,567 @@ async def diagnose_asu_api(
         except PlaywrightTimeoutError:
 
             print(
-                "Initial page navigation timed out. "
-                "Continuing to wait for API traffic."
+                "Bootstrap navigation timed out. "
+                "Continuing because API/session "
+                "state may still be available."
             )
 
+        # Give the SPA time to initialize authentication.
+        await page.wait_for_timeout(
+            8000
+        )
+
         # ====================================================
-        # WAIT FOR /search/classes RESPONSE
+        # STEP 2
+        #
+        # Inspect browser storage so we know whether the
+        # authenticated API request can be made from the
+        # browser's request context.
         # ====================================================
 
-        # The SPA makes several startup requests:
-        #
-        # /appsettings
-        # /classes
-        # /terms
-        # /subjects
-        #
-        # Give it enough time to finish those requests.
+        storage_state = (
+            await context.storage_state()
+        )
 
-        for _ in range(
-            30
+        print(
+            "Cookies established:",
+            len(
+                storage_state.get(
+                    "cookies",
+                    [],
+                )
+            ),
+        )
+
+        # ====================================================
+        # STEP 3
+        #
+        # Make a subject-wide request through the SAME
+        # authenticated browser context.
+        #
+        # This avoids rendering hundreds of class pages.
+        # ====================================================
+
+        api_url = (
+            "https://eadvs-cscc-catalog-api.apps.asu.edu/"
+            "catalog-microservices/api/v1/"
+            "search/classes"
+            "?refine=Y"
+            "&advanced=true"
+            "&campusOrOnlineSelection=A"
+            f"&subject={subject}"
+            "&honors=F"
+            "&promod=F"
+            "&searchType=all"
+            f"&term={term}"
+        )
+
+        print(
+            "\n========================================"
+        )
+
+        print(
+            "BULK API REQUEST"
+        )
+
+        print(
+            api_url
+        )
+
+        print(
+            "========================================\n"
+        )
+
+        # ----------------------------------------------------
+        # IMPORTANT
+        #
+        # Use page.evaluate(fetch()) rather than Python
+        # requests.
+        #
+        # That keeps us inside the normal browser environment
+        # established by ASU's frontend.
+        # ----------------------------------------------------
+
+        result = await page.evaluate(
+            """
+            async (url) => {
+
+                try {
+
+                    const response =
+                        await fetch(
+                            url,
+                            {
+                                method: 'GET',
+                                credentials: 'include',
+                                headers: {
+                                    'Accept':
+                                        'application/json'
+                                }
+                            }
+                        );
+
+                    const text =
+                        await response.text();
+
+                    let data = null;
+
+                    try {
+
+                        data =
+                            JSON.parse(
+                                text
+                            );
+
+                    } catch (error) {
+
+                        data = {
+                            raw:
+                                text.substring(
+                                    0,
+                                    2000
+                                )
+                        };
+
+                    }
+
+                    return {
+                        status:
+                            response.status,
+
+                        ok:
+                            response.ok,
+
+                        data:
+                            data
+                    };
+
+                } catch (error) {
+
+                    return {
+                        status:
+                            0,
+
+                        ok:
+                            false,
+
+                        error:
+                            String(
+                                error
+                            )
+                    };
+
+                }
+
+            }
+            """,
+            api_url,
+        )
+
+        print(
+            "Bulk API status:",
+            result.get(
+                "status"
+            ),
+        )
+
+        # ====================================================
+        # STEP 4
+        #
+        # PROCESS RESPONSE
+        # ====================================================
+
+        if not result.get(
+            "ok"
         ):
 
-            if (
-                class_api_responses
-            ):
-                break
-
-            await page.wait_for_timeout(
-                500
+            print(
+                "Bulk API request failed:",
+                result,
             )
 
-        # Small additional delay so any response handler
-        # still executing can finish.
+            await browser.close()
 
-        await page.wait_for_timeout(
-            1000
+            return {
+                "ok":
+                    False,
+
+                "subject":
+                    subject,
+
+                "term":
+                    term,
+
+                "bulk_status":
+                    result.get(
+                        "status"
+                    ),
+
+                "bulk_error":
+                    result.get(
+                        "error"
+                    ),
+
+                "bulk_data":
+                    result.get(
+                        "data"
+                    ),
+
+                "requests":
+                    captured_requests,
+            }
+
+        data = (
+            result.get(
+                "data"
+            ) or {}
         )
 
-        # ====================================================
-        # SUMMARY
-        # ====================================================
+        classes = (
+            data.get(
+                "classes",
+                []
+            )
+        )
 
-        print(
-            "\n"
-            "========== DIAGNOSTIC SUMMARY =========="
+        total_data = (
+            data.get(
+                "total"
+            )
+        )
+
+        # ASU returns:
+        #
+        # "total": {
+        #     "value": 123,
+        #     "relation": "eq"
+        # }
+
+        if isinstance(
+            total_data,
+            dict,
+        ):
+
+            total = (
+                total_data.get(
+                    "value"
+                )
+            )
+
+        else:
+
+            total = (
+                total_data
+            )
+
+        scroll_id = (
+            data.get(
+                "scrollId"
+            )
         )
 
         print(
-            "Catalog requests captured:",
+            "Returned classes:",
             len(
-                captured_requests
+                classes
             ),
         )
 
         print(
-            "Class API responses captured:",
-            len(
-                class_api_responses
+            "Reported total:",
+            total,
+        )
+
+        print(
+            "Scroll ID present:",
+            bool(
+                scroll_id
             ),
         )
 
         # ====================================================
-        # CLOSE
+        # STEP 5
+        #
+        # Extract only fields useful to our automation.
+        #
+        # Do NOT return the enormous full ASU response.
+        # ====================================================
+
+        simplified = []
+
+        for item in classes:
+
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
+
+            clas = (
+                item.get(
+                    "CLAS",
+                    {}
+                )
+            )
+
+            if not isinstance(
+                clas,
+                dict,
+            ):
+                continue
+
+            # ------------------------------------------------
+            # SEAT DATA
+            # ------------------------------------------------
+
+            seat_info = (
+                item.get(
+                    "seatInfo",
+                    {}
+                )
+            )
+
+            if not isinstance(
+                seat_info,
+                dict,
+            ):
+
+                seat_info = {}
+
+            enroll_cap = (
+                seat_info.get(
+                    "ENRL_CAP"
+                )
+            )
+
+            enroll_total = (
+                seat_info.get(
+                    "ENRL_TOT"
+                )
+            )
+
+            # Fallback to CLAS fields.
+            if enroll_cap is None:
+
+                enroll_cap = (
+                    clas.get(
+                        "ENRLCAP"
+                    )
+                )
+
+            if enroll_total is None:
+
+                enroll_total = (
+                    clas.get(
+                        "ENRLTOT"
+                    )
+                )
+
+            # ------------------------------------------------
+            # OPEN SEATS
+            # ------------------------------------------------
+
+            open_seats = None
+
+            try:
+
+                if (
+                    enroll_cap is not None
+                    and
+                    enroll_total is not None
+                ):
+
+                    open_seats = (
+                        int(
+                            enroll_cap
+                        )
+                        -
+                        int(
+                            enroll_total
+                        )
+                    )
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                open_seats = None
+
+            # ------------------------------------------------
+            # INSTRUCTOR
+            # ------------------------------------------------
+
+            instructor_first = ""
+
+            instructor_last = ""
+
+            first_names = (
+                clas.get(
+                    "INSTRUCTORSFIRSTNAMESHOWALL"
+                )
+                or
+                clas.get(
+                    "INSTRUCTORSFIRSTNAMELIST"
+                )
+                or
+                []
+            )
+
+            last_names = (
+                clas.get(
+                    "INSTRUCTORSLASTNAMESHOWALL"
+                )
+                or
+                clas.get(
+                    "INSTRUCTORSLASTNAMELIST"
+                )
+                or
+                []
+            )
+
+            if first_names:
+
+                instructor_first = str(
+                    first_names[0]
+                ).split(
+                    "~"
+                )[0]
+
+            if last_names:
+
+                instructor_last = str(
+                    last_names[0]
+                ).split(
+                    "~"
+                )[0]
+
+            simplified.append({
+
+                "class_num":
+                    clas.get(
+                        "CLASSNBR"
+                    ),
+
+                "subject":
+                    clas.get(
+                        "SUBJECT"
+                    ),
+
+                "catalog_num":
+                    clas.get(
+                        "CATALOGNBR"
+                    ),
+
+                "section":
+                    clas.get(
+                        "CLASSSECTION"
+                    ),
+
+                "session":
+                    clas.get(
+                        "SESSIONCODE"
+                    ),
+
+                "component":
+                    clas.get(
+                        "SSRCOMPONENT"
+                    ),
+
+                "title":
+                    clas.get(
+                        "TITLE"
+                    ),
+
+                "instructor_first":
+                    instructor_first,
+
+                "instructor_last":
+                    instructor_last,
+
+                "enroll_cap":
+                    enroll_cap,
+
+                "enroll_total":
+                    enroll_total,
+
+                "open_seats":
+                    open_seats,
+            })
+
+        # ====================================================
+        # STEP 6
+        #
+        # SAMPLE OUTPUT
+        # ====================================================
+
+        print(
+            "\nFirst five simplified classes:"
+        )
+
+        for item in (
+            simplified[:5]
+        ):
+
+            print(
+                item
+            )
+
+        # ====================================================
+        # FINISH
         # ====================================================
 
         await browser.close()
 
-        # ====================================================
-        # RETURN EVERYTHING NEEDED FOR ANALYSIS
-        # ====================================================
+        bulk_response[
+            "found"
+        ] = True
+
+        bulk_response[
+            "status"
+        ] = result.get(
+            "status"
+        )
+
+        bulk_response[
+            "url"
+        ] = api_url
+
+        bulk_response[
+            "total"
+        ] = total
+
+        bulk_response[
+            "returned"
+        ] = len(
+            simplified
+        )
+
+        bulk_response[
+            "scroll_id"
+        ] = (
+            scroll_id
+        )
+
+        bulk_response[
+            "classes"
+        ] = (
+            simplified
+        )
 
         return {
-            "class_num":
-                str(
-                    class_num
-                ),
+            "ok":
+                True,
+
+            "subject":
+                subject,
 
             "term":
-                str(
-                    term
-                ),
+                term,
+
+            "bulk":
+                bulk_response,
 
             "requests":
                 captured_requests,
-
-            "class_api":
-                class_api_responses,
         }
