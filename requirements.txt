@@ -4,4 +4,3 @@ playwright
 gspread
 google-auth
 pydantic
-google-cloud-tasks

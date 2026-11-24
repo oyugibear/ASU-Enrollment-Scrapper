@@ -1,41 +1,52 @@
 import json
+import os
+import threading
 import uuid
+
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import google.auth
 import gspread
 
-from fastapi import FastAPI, HTTPException
+from google.oauth2 import service_account
+
+from fastapi import (
+    FastAPI,
+    HTTPException,
+)
+
 from pydantic import BaseModel
-from google.cloud import tasks_v2
 
 from scraper import run_enrollment
 
 
-app = FastAPI()
+# ============================================================
+# APP
+# ============================================================
+
+app = FastAPI(
+    title="ASU Enrollment Scraper",
+    version="2.0.0",
+)
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-PROJECT_ID = "physics-automation-504617"
-REGION = "us-central1"
-QUEUE_NAME = "enrollment-queue"
-
-CLOUD_RUN_URL = (
-    "https://enrollment-api-955146718767.us-central1.run.app"
+JOB_SHEET_NAME = (
+    "Enrollment Jobs"
 )
 
-SERVICE_ACCOUNT_EMAIL = (
-    "enrollment-scraper@physics-automation-504617."
-    "iam.gserviceaccount.com"
+ARIZONA_TZ = ZoneInfo(
+    "America/Phoenix"
 )
 
-JOB_SHEET_NAME = "Enrollment Jobs"
-
-ARIZONA_TZ = ZoneInfo("America/Phoenix")
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 
 # ============================================================
@@ -43,10 +54,17 @@ ARIZONA_TZ = ZoneInfo("America/Phoenix")
 # ============================================================
 
 QUEUED = "QUEUED"
+
 RUNNING = "RUNNING"
+
 COMPLETE = "COMPLETE"
-CANCEL_REQUESTED = "CANCEL_REQUESTED"
+
+CANCEL_REQUESTED = (
+    "CANCEL_REQUESTED"
+)
+
 CANCELLED = "CANCELLED"
+
 ERROR = "ERROR"
 
 
@@ -83,25 +101,38 @@ JOB_HEADERS = [
 # ============================================================
 
 class RunRequest(BaseModel):
+
     sheet_url: str
+
     sheet_name: str
+
     term: str
-    concurrency: int = 5
+
+    concurrency: int = 2
 
 
 class StartRequest(BaseModel):
+
     sheet_url: str
+
     sheet_name: str
+
     term: str
-    concurrency: int = 1
+
+    concurrency: int = 2
 
 
 class TaskRequest(BaseModel):
+
     job_id: str
+
     sheet_url: str
+
     sheet_name: str
+
     term: str
-    concurrency: int = 1
+
+    concurrency: int = 2
 
 
 # ============================================================
@@ -109,6 +140,7 @@ class TaskRequest(BaseModel):
 # ============================================================
 
 class JobCancelled(Exception):
+
     pass
 
 
@@ -117,12 +149,14 @@ class JobCancelled(Exception):
 # ============================================================
 
 def now_iso():
+
     return datetime.now(
         timezone.utc
     ).isoformat()
 
 
 def local_time():
+
     return datetime.now(
         ARIZONA_TZ
     ).strftime(
@@ -130,38 +164,102 @@ def local_time():
     )
 
 
-def safe_int(value):
+def safe_int(
+    value,
+):
+
     try:
-        return int(value or 0)
-    except (TypeError, ValueError):
+
+        return int(
+            value or 0
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
         return 0
 
 
 # ============================================================
-# GOOGLE CLIENT
+# GOOGLE AUTHENTICATION
 # ============================================================
 
-def get_google_client():
+def get_google_credentials():
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
+    # --------------------------------------------------------
+    # RENDER
+    #
+    # The complete Google service-account JSON is stored
+    # securely in the Render environment variable:
+    #
+    # GOOGLE_SERVICE_ACCOUNT_JSON
+    # --------------------------------------------------------
+
+    raw_json = os.getenv(
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "",
+    ).strip()
+
+    if raw_json:
+
+        try:
+
+            info = json.loads(
+                raw_json
+            )
+
+        except json.JSONDecodeError as e:
+
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON "
+                "contains invalid JSON."
+            ) from e
+
+        credentials = (
+            service_account
+            .Credentials
+            .from_service_account_info(
+                info,
+                scopes=GOOGLE_SCOPES,
+            )
+        )
+
+        print(
+            "Google authentication: "
+            "Render service account"
+        )
+
+        print(
+            "Service account:",
+            credentials.service_account_email,
+        )
+
+        return credentials
+
+    # --------------------------------------------------------
+    # GOOGLE CLOUD / CLOUD SHELL FALLBACK
+    # --------------------------------------------------------
 
     credentials, project = (
         google.auth.default(
-            scopes=scopes
+            scopes=GOOGLE_SCOPES
         )
     )
 
     print(
+        "Google authentication: ADC"
+    )
+
+    print(
         "ADC project:",
-        project
+        project,
     )
 
     print(
         "Credential type:",
-        type(credentials).__name__
+        type(credentials).__name__,
     )
 
     print(
@@ -169,8 +267,17 @@ def get_google_client():
         getattr(
             credentials,
             "service_account_email",
-            "unknown"
-        )
+            "unknown",
+        ),
+    )
+
+    return credentials
+
+
+def get_google_client():
+
+    credentials = (
+        get_google_credentials()
     )
 
     return gspread.authorize(
@@ -181,9 +288,15 @@ def get_google_client():
 # ============================================================
 # JOB STORE
 #
-# IMPORTANT:
-# A JobStore opens the spreadsheet ONCE and keeps the
-# worksheet + row number for the lifetime of the request.
+# Google Sheets remains the persistent job store.
+#
+# This means:
+#
+# - Render does not need a database.
+# - Status survives individual HTTP requests.
+# - The sidebar continues using /status.
+# - Cancellation continues using the job status cell.
+#
 # ============================================================
 
 class JobStore:
@@ -191,13 +304,20 @@ class JobStore:
     def __init__(
         self,
         sheet_url,
-        job_id=None
+        job_id=None,
     ):
 
-        self.sheet_url = sheet_url
-        self.job_id = job_id
+        self.sheet_url = (
+            sheet_url
+        )
 
-        self.gc = get_google_client()
+        self.job_id = (
+            job_id
+        )
+
+        self.gc = (
+            get_google_client()
+        )
 
         self.spreadsheet = (
             self.gc.open_by_url(
@@ -212,6 +332,7 @@ class JobStore:
         self.row_number = None
 
         if job_id:
+
             self.row_number = (
                 self._find_job_row(
                     job_id
@@ -223,13 +344,14 @@ class JobStore:
     # --------------------------------------------------------
 
     def _get_or_create_job_sheet(
-        self
+        self,
     ):
 
         try:
 
             worksheet = (
-                self.spreadsheet.worksheet(
+                self.spreadsheet
+                .worksheet(
                     JOB_SHEET_NAME
                 )
             )
@@ -241,21 +363,33 @@ class JobStore:
             )
 
             worksheet = (
-                self.spreadsheet.add_worksheet(
-                    title=JOB_SHEET_NAME,
-                    rows=1000,
-                    cols=len(JOB_HEADERS)
+                self.spreadsheet
+                .add_worksheet(
+                    title=
+                        JOB_SHEET_NAME,
+
+                    rows=
+                        1000,
+
+                    cols=
+                        len(
+                            JOB_HEADERS
+                        ),
                 )
             )
 
             worksheet.append_row(
                 JOB_HEADERS,
-                value_input_option="RAW"
+                value_input_option=
+                    "RAW",
             )
 
             try:
+
                 worksheet.hide()
+
             except Exception:
+
                 pass
 
         return worksheet
@@ -266,14 +400,18 @@ class JobStore:
 
     def _find_job_row(
         self,
-        job_id
+        job_id,
     ):
 
         try:
 
-            cell = self.worksheet.find(
-                str(job_id),
-                in_column=1
+            cell = (
+                self.worksheet.find(
+                    str(
+                        job_id
+                    ),
+                    in_column=1,
+                )
             )
 
         except gspread.CellNotFound:
@@ -284,27 +422,30 @@ class JobStore:
 
             raise ValueError(
                 f"Enrollment job "
-                f"{job_id} was not found."
+                f"{job_id} "
+                "was not found."
             )
 
         return cell.row
 
     # --------------------------------------------------------
-    # CREATE
+    # CREATE JOB
     # --------------------------------------------------------
 
     def create_job(
         self,
         sheet_name,
         term,
-        concurrency
+        concurrency,
     ):
 
         job_id = (
-            uuid.uuid4().hex[:12]
+            uuid.uuid4()
+            .hex[:12]
         )
 
         record = {
+
             "job_id":
                 job_id,
 
@@ -368,16 +509,20 @@ class JobStore:
 
         self.worksheet.append_row(
             [
-                record[header]
-                for header in JOB_HEADERS
+                record[
+                    header
+                ]
+                for header
+                in JOB_HEADERS
             ],
-            value_input_option="RAW"
+            value_input_option=
+                "RAW",
         )
 
-        self.job_id = job_id
+        self.job_id = (
+            job_id
+        )
 
-        # Since we just appended it, this is one
-        # lightweight lookup to establish its row.
         self.row_number = (
             self._find_job_row(
                 job_id
@@ -392,10 +537,12 @@ class JobStore:
         return job_id
 
     # --------------------------------------------------------
-    # READ EXACT ROW
+    # READ JOB
     # --------------------------------------------------------
 
-    def read(self):
+    def read(
+        self,
+    ):
 
         if not self.row_number:
 
@@ -403,27 +550,42 @@ class JobStore:
                 "Job row is not initialized."
             )
 
-        row = self.worksheet.row_values(
-            self.row_number
+        row = (
+            self.worksheet
+            .row_values(
+                self.row_number
+            )
         )
 
-        row += [""] * (
-            len(JOB_HEADERS) -
-            len(row)
+        row += (
+            [""] *
+            (
+                len(
+                    JOB_HEADERS
+                ) -
+                len(
+                    row
+                )
+            )
         )
 
         return {
             header:
                 row[index]
+
             for index, header
-            in enumerate(JOB_HEADERS)
+            in enumerate(
+                JOB_HEADERS
+            )
         }
 
     # --------------------------------------------------------
-    # READ ONLY STATUS CELL
+    # READ STATUS ONLY
     # --------------------------------------------------------
 
-    def read_status(self):
+    def read_status(
+        self,
+    ):
 
         if not self.row_number:
 
@@ -432,19 +594,22 @@ class JobStore:
             )
 
         return str(
-            self.worksheet.cell(
+            self.worksheet
+            .cell(
                 self.row_number,
-                2
-            ).value or ""
+                2,
+            )
+            .value
+            or ""
         ).strip().upper()
 
     # --------------------------------------------------------
-    # DIRECT UPDATE
+    # UPDATE JOB
     # --------------------------------------------------------
 
     def update(
         self,
-        **changes
+        **changes,
     ):
 
         if not self.row_number:
@@ -455,25 +620,32 @@ class JobStore:
 
         updates = []
 
-        for key, value in changes.items():
+        for key, value in (
+            changes.items()
+        ):
 
             if key not in JOB_HEADERS:
+
                 continue
 
             column_number = (
-                JOB_HEADERS.index(key) + 1
+                JOB_HEADERS.index(
+                    key
+                ) +
+                1
             )
 
             updates.append({
                 "range":
-                    gspread.utils.rowcol_to_a1(
+                    gspread.utils
+                    .rowcol_to_a1(
                         self.row_number,
-                        column_number
+                        column_number,
                     ),
 
                 "values": [[
                     value
-                ]]
+                ]],
             })
 
         if updates:
@@ -484,151 +656,197 @@ class JobStore:
 
 
 # ============================================================
-# CLOUD TASK
+# HEALTH
 # ============================================================
 
-def create_cloud_task(
+@app.get(
+    "/health"
+)
+def health():
+
+    return {
+        "ok":
+            True,
+
+        "platform":
+            "render",
+
+        "async_jobs":
+            True,
+
+        "job_store":
+            "google_sheets",
+
+        "batch_updates":
+            True,
+
+        "cloud_tasks":
+            False,
+    }
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get(
+    "/"
+)
+def root():
+
+    return {
+        "service":
+            "ASU Enrollment Scraper",
+
+        "status":
+            "online",
+
+        "platform":
+            "render",
+    }
+
+
+# ============================================================
+# BACKGROUND WORKER
+# ============================================================
+
+def launch_background_job(
     job_id,
     sheet_url,
     sheet_name,
     term,
-    concurrency
+    concurrency,
 ):
 
-    client = (
-        tasks_v2.CloudTasksClient()
-    )
-
-    parent = client.queue_path(
-        PROJECT_ID,
-        REGION,
-        QUEUE_NAME
-    )
-
-    payload = {
-        "job_id":
+    task_request = TaskRequest(
+        job_id=
             job_id,
 
-        "sheet_url":
+        sheet_url=
             sheet_url,
 
-        "sheet_name":
+        sheet_name=
             sheet_name,
 
-        "term":
+        term=
             term,
 
-        "concurrency":
+        concurrency=
             concurrency,
-    }
-
-    task = {
-        "http_request": {
-
-            "http_method":
-                tasks_v2.HttpMethod.POST,
-
-            "url":
-                f"{CLOUD_RUN_URL}/run-task",
-
-            "headers": {
-                "Content-Type":
-                    "application/json"
-            },
-
-            "body":
-                json.dumps(
-                    payload
-                ).encode(),
-
-            "oidc_token": {
-                "service_account_email":
-                    SERVICE_ACCOUNT_EMAIL,
-
-                "audience":
-                    CLOUD_RUN_URL,
-            },
-        }
-    }
-
-    created_task = (
-        client.create_task(
-            request={
-                "parent":
-                    parent,
-
-                "task":
-                    task,
-            }
-        )
     )
+
+    def worker():
+
+        print(
+            f"BACKGROUND WORKER STARTING: "
+            f"{job_id}"
+        )
+
+        try:
+
+            run_task(
+                task_request
+            )
+
+        except Exception as e:
+
+            # run_task already attempts to write
+            # ERROR into Enrollment Jobs.
+            #
+            # We catch here so an exception inside
+            # the thread does not produce an
+            # unhandled thread traceback only.
+
+            print(
+                f"BACKGROUND WORKER ERROR "
+                f"{job_id}: "
+                f"{type(e).__name__}: "
+                f"{e}"
+            )
+
+    thread = threading.Thread(
+        target=
+            worker,
+
+        name=
+            f"enrollment-{job_id}",
+
+        daemon=
+            True,
+    )
+
+    thread.start()
 
     print(
-        "Created Cloud Task:",
-        created_task.name
+        f"Background worker launched "
+        f"for {job_id}"
     )
-
-    return created_task
-
-
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.get("/health")
-def health():
-
-    return {
-        "ok": True,
-        "async_jobs": True,
-        "job_store": "google_sheets",
-        "batch_updates": True,
-    }
 
 
 # ============================================================
 # START
 # ============================================================
 
-@app.post("/start")
+@app.post(
+    "/start"
+)
 def start_job(
-    req: StartRequest
+    req: StartRequest,
 ):
+
+    # --------------------------------------------------------
+    # RENDER CONCURRENCY
+    # --------------------------------------------------------
 
     if req.concurrency not in [
         1,
-        5
+        2,
+        3,
     ]:
 
         raise HTTPException(
-            status_code=400,
-            detail=(
-                "Concurrency must be "
-                "1 or 5."
-            )
+            status_code=
+                400,
+
+            detail=
+                (
+                    "Concurrency must be "
+                    "1, 2, or 3."
+                ),
         )
 
     store = None
+
     job_id = None
 
     try:
+
+        # ----------------------------------------------------
+        # CREATE JOB
+        # ----------------------------------------------------
 
         store = JobStore(
             req.sheet_url
         )
 
-        job_id = store.create_job(
-            sheet_name=
-                req.sheet_name,
+        job_id = (
+            store.create_job(
+                sheet_name=
+                    req.sheet_name,
 
-            term=
-                req.term,
+                term=
+                    req.term,
 
-            concurrency=
-                req.concurrency
+                concurrency=
+                    req.concurrency,
+            )
         )
 
-        create_cloud_task(
+        # ----------------------------------------------------
+        # START BACKGROUND WORKER
+        # ----------------------------------------------------
+
+        launch_background_job(
             job_id=
                 job_id,
 
@@ -642,8 +860,12 @@ def start_job(
                 req.term,
 
             concurrency=
-                req.concurrency
+                req.concurrency,
         )
+
+        # ----------------------------------------------------
+        # RETURN IMMEDIATELY
+        # ----------------------------------------------------
 
         return {
             "status":
@@ -657,7 +879,9 @@ def start_job(
 
         print(
             "START JOB ERROR:",
-            repr(e)
+            repr(
+                e
+            ),
         )
 
         if (
@@ -668,23 +892,38 @@ def start_job(
             try:
 
                 store.update(
-                    status=ERROR,
-                    completed=now_iso(),
-                    fatal_error=(
-                        f"{type(e).__name__}: "
-                        f"{e}"
-                    )
+                    status=
+                        ERROR,
+
+                    completed=
+                        now_iso(),
+
+                    fatal_error=
+                        (
+                            f"{type(e).__name__}: "
+                            f"{e}"
+                        ),
                 )
 
-            except Exception:
-                pass
+            except Exception as update_error:
+
+                print(
+                    "FAILED TO RECORD "
+                    "START ERROR:",
+                    repr(
+                        update_error
+                    ),
+                )
 
         raise HTTPException(
-            status_code=500,
-            detail=(
-                f"{type(e).__name__}: "
-                f"{e}"
-            )
+            status_code=
+                500,
+
+            detail=
+                (
+                    f"{type(e).__name__}: "
+                    f"{e}"
+                ),
         )
 
 
@@ -692,27 +931,33 @@ def start_job(
 # CANCEL
 # ============================================================
 
-@app.post("/cancel/{job_id}")
+@app.post(
+    "/cancel/{job_id}"
+)
 def cancel_job(
     job_id: str,
-    sheet_url: str
+    sheet_url: str,
 ):
 
     try:
 
         store = JobStore(
             sheet_url,
-            job_id
+            job_id,
         )
 
         current_status = (
             store.read_status()
         )
 
+        # ----------------------------------------------------
+        # ALREADY FINISHED
+        # ----------------------------------------------------
+
         if current_status in [
             COMPLETE,
             CANCELLED,
-            ERROR
+            ERROR,
         ]:
 
             return {
@@ -722,6 +967,10 @@ def cancel_job(
                 "job_id":
                     job_id,
             }
+
+        # ----------------------------------------------------
+        # REQUEST CANCELLATION
+        # ----------------------------------------------------
 
         store.update(
             status=
@@ -744,46 +993,67 @@ def cancel_job(
     except ValueError as e:
 
         raise HTTPException(
-            status_code=404,
-            detail=str(e)
+            status_code=
+                404,
+
+            detail=
+                str(
+                    e
+                ),
         )
 
     except Exception as e:
 
         print(
             "CANCEL ERROR:",
-            repr(e)
+            repr(
+                e
+            ),
         )
 
         raise HTTPException(
-            status_code=500,
-            detail=(
-                f"{type(e).__name__}: "
-                f"{e}"
-            )
+            status_code=
+                500,
+
+            detail=
+                (
+                    f"{type(e).__name__}: "
+                    f"{e}"
+                ),
         )
 
 
 # ============================================================
 # RUN TASK
+#
+# This used to be called by Google Cloud Tasks.
+#
+# On Render it is called internally by the background
+# thread started by /start.
+#
+# The endpoint remains available for debugging/manual use.
 # ============================================================
 
-@app.post("/run-task")
+@app.post(
+    "/run-task"
+)
 def run_task(
-    req: TaskRequest
+    req: TaskRequest,
 ):
 
     store = None
 
+    progress_logs = []
+
     try:
 
         # ----------------------------------------------------
-        # OPEN JOB STORE ONCE
+        # OPEN JOB
         # ----------------------------------------------------
 
         store = JobStore(
             req.sheet_url,
-            req.job_id
+            req.job_id,
         )
 
         current_status = (
@@ -791,10 +1061,13 @@ def run_task(
         )
 
         # ----------------------------------------------------
-        # TERMINAL / DUPLICATE PROTECTION
+        # DUPLICATE / TERMINAL PROTECTION
         # ----------------------------------------------------
 
-        if current_status == COMPLETE:
+        if (
+            current_status ==
+            COMPLETE
+        ):
 
             return {
                 "status":
@@ -804,7 +1077,10 @@ def run_task(
                     req.job_id,
             }
 
-        if current_status == CANCELLED:
+        if (
+            current_status ==
+            CANCELLED
+        ):
 
             return {
                 "status":
@@ -814,7 +1090,10 @@ def run_task(
                     req.job_id,
             }
 
-        if current_status == RUNNING:
+        if (
+            current_status ==
+            RUNNING
+        ):
 
             print(
                 f"Job {req.job_id} "
@@ -829,11 +1108,17 @@ def run_task(
                     req.job_id,
             }
 
-        if current_status == CANCEL_REQUESTED:
+        if (
+            current_status ==
+            CANCEL_REQUESTED
+        ):
 
             store.update(
-                status=CANCELLED,
-                completed=now_iso()
+                status=
+                    CANCELLED,
+
+                completed=
+                    now_iso(),
             )
 
             return {
@@ -856,7 +1141,7 @@ def run_task(
                 now_iso(),
 
             fatal_error=
-                ""
+                "",
         )
 
         print(
@@ -870,10 +1155,8 @@ def run_task(
         )
 
         # ----------------------------------------------------
-        # LIVE STATE
+        # PROGRESS STATE
         # ----------------------------------------------------
-
-        progress_logs = []
 
         last_saved_processed = -1
 
@@ -881,25 +1164,27 @@ def run_task(
         # PROGRESS CALLBACK
         # ----------------------------------------------------
 
-        def progress_callback(event):
+        def progress_callback(
+            event,
+        ):
 
             nonlocal last_saved_processed
 
             event_type = (
                 event.get(
                     "type",
-                    ""
+                    "",
                 )
             )
 
-            # ================================================
+            # =================================================
             # CANCELLATION CHECK
-            #
-            # Only perform a Sheets read at explicit scraper
-            # checkpoints, not on every callback.
-            # ================================================
+            # =================================================
 
-            if event_type == "checkpoint":
+            if (
+                event_type ==
+                "checkpoint"
+            ):
 
                 current = (
                     store.read_status()
@@ -915,13 +1200,15 @@ def run_task(
                         "was cancelled."
                     )
 
-            # ================================================
-            # LOG
-            # ================================================
+            # =================================================
+            # LOG MESSAGE
+            # =================================================
 
-            message = event.get(
-                "message",
-                ""
+            message = (
+                event.get(
+                    "message",
+                    "",
+                )
             )
 
             if message:
@@ -931,60 +1218,76 @@ def run_task(
                     f"{message}"
                 )
 
-            # ================================================
+            # =================================================
             # CLASS RESULTS
-            # ================================================
+            # =================================================
 
             for item in event.get(
                 "results",
-                []
+                [],
             ):
 
                 class_num = str(
                     item.get(
                         "class_num",
-                        ""
+                        "",
                     )
                 )
 
                 status = (
                     item.get(
                         "status",
-                        ""
+                        "",
                     )
                 )
 
-                if status == "SUCCESS":
+                if (
+                    status ==
+                    "SUCCESS"
+                ):
 
                     progress_logs.append(
-                        f"{class_num}: SUCCESS"
+                        f"{class_num}: "
+                        "SUCCESS"
                     )
 
-                elif status == "ERROR":
+                elif (
+                    status ==
+                    "ERROR"
+                ):
 
                     progress_logs.append(
-                        f"{class_num}: ERROR - "
+                        f"{class_num}: "
+                        "ERROR - "
                         f"{item.get(
                             'error_type',
                             'UNKNOWN_ERROR'
                         )}"
                     )
 
-                elif status == "NO_DATA":
+                elif (
+                    status ==
+                    "NO_DATA"
+                ):
 
                     progress_logs.append(
-                        f"{class_num}: NO DATA - "
+                        f"{class_num}: "
+                        "NO DATA - "
                         f"{item.get(
                             'error_type',
                             'NO_DATA'
                         )}"
                     )
 
-            # ================================================
-            # SAVE ONLY AFTER A BATCH COMPLETES
-            # ================================================
+            # =================================================
+            # SAVE ONLY AFTER BATCH COMPLETES
+            # =================================================
 
-            if event_type != "batch_complete":
+            if (
+                event_type !=
+                "batch_complete"
+            ):
+
                 return
 
             processed = safe_int(
@@ -997,6 +1300,7 @@ def run_task(
                 processed ==
                 last_saved_processed
             ):
+
                 return
 
             store.update(
@@ -1007,6 +1311,20 @@ def run_task(
                     safe_int(
                         event.get(
                             "successful"
+                        )
+                    ),
+
+                changed=
+                    safe_int(
+                        event.get(
+                            "changed"
+                        )
+                    ),
+
+                unchanged=
+                    safe_int(
+                        event.get(
+                            "unchanged"
                         )
                     ),
 
@@ -1026,8 +1344,10 @@ def run_task(
 
                 logs=
                     "\n".join(
-                        progress_logs[-100:]
-                    )
+                        progress_logs[
+                            -100:
+                        ]
+                    ),
             )
 
             last_saved_processed = (
@@ -1052,7 +1372,7 @@ def run_task(
                 req.concurrency,
 
             progress_callback=
-                progress_callback
+                progress_callback,
         )
 
         # ----------------------------------------------------
@@ -1074,51 +1394,53 @@ def run_task(
             classes_processed=
                 result.get(
                     "classes_processed",
-                    0
+                    0,
                 ),
 
             successful=
                 result.get(
                     "successful",
-                    0
+                    0,
                 ),
 
             changed=
                 result.get(
                     "changed",
-                    0
+                    0,
                 ),
 
             unchanged=
                 result.get(
                     "unchanged",
-                    0
+                    0,
                 ),
 
             errors=
                 result.get(
                     "errors",
-                    0
+                    0,
                 ),
 
             needs_review=
                 result.get(
                     "needs_review",
-                    0
+                    0,
                 ),
 
-            previous_sheet=(
-                result.get(
-                    "previous_sheet",
-                    ""
-                ) or ""
-            ),
+            previous_sheet=
+                (
+                    result.get(
+                        "previous_sheet",
+                        "",
+                    )
+                    or ""
+                ),
 
             error_classes=
                 json.dumps(
                     result.get(
                         "error_classes",
-                        []
+                        [],
                     )
                 ),
 
@@ -1126,21 +1448,25 @@ def run_task(
                 json.dumps(
                     result.get(
                         "no_data_classes",
-                        []
+                        [],
                     )
                 ),
 
             logs=
                 "\n".join(
-                    progress_logs[-100:]
+                    progress_logs[
+                        -100:
+                    ]
                 ),
 
             fatal_error=
-                ""
+                "",
         )
 
         print(
-            f"JOB {req.job_id} COMPLETE"
+            f"JOB "
+            f"{req.job_id} "
+            "COMPLETE"
         )
 
         return {
@@ -1158,13 +1484,19 @@ def run_task(
     except JobCancelled:
 
         print(
-            f"JOB {req.job_id} "
+            f"JOB "
+            f"{req.job_id} "
             "CANCELLED"
         )
 
         try:
 
             if store:
+
+                progress_logs.append(
+                    f"[{local_time()}] "
+                    "Enrollment run cancelled."
+                )
 
                 store.update(
                     status=
@@ -1173,13 +1505,12 @@ def run_task(
                     completed=
                         now_iso(),
 
-                    logs=(
+                    logs=
                         "\n".join(
-                            progress_logs[-100:]
-                        ) +
-                        "\n[CANCELLED] "
-                        "Enrollment run cancelled."
-                    )
+                            progress_logs[
+                                -100:
+                            ]
+                        ),
                 )
 
         except Exception as e:
@@ -1187,11 +1518,11 @@ def run_task(
             print(
                 "FAILED TO RECORD "
                 "CANCELLATION:",
-                repr(e)
+                repr(
+                    e
+                ),
             )
 
-        # Return 200 so Cloud Tasks
-        # does not retry cancellation.
         return {
             "status":
                 CANCELLED,
@@ -1201,7 +1532,7 @@ def run_task(
         }
 
     # --------------------------------------------------------
-    # FATAL
+    # FATAL ERROR
     # --------------------------------------------------------
 
     except Exception as e:
@@ -1217,6 +1548,13 @@ def run_task(
 
             if store:
 
+                progress_logs.append(
+                    f"[{local_time()}] "
+                    f"FATAL ERROR: "
+                    f"{type(e).__name__}: "
+                    f"{e}"
+                )
+
                 store.update(
                     status=
                         ERROR,
@@ -1224,10 +1562,18 @@ def run_task(
                     completed=
                         now_iso(),
 
-                    fatal_error=(
-                        f"{type(e).__name__}: "
-                        f"{e}"
-                    )
+                    logs=
+                        "\n".join(
+                            progress_logs[
+                                -100:
+                            ]
+                        ),
+
+                    fatal_error=
+                        (
+                            f"{type(e).__name__}: "
+                            f"{e}"
+                        ),
                 )
 
         except Exception as update_error:
@@ -1235,15 +1581,30 @@ def run_task(
             print(
                 "FAILED TO RECORD "
                 "JOB ERROR:",
-                repr(update_error)
+                repr(
+                    update_error
+                ),
             )
 
+        # ----------------------------------------------------
+        # IMPORTANT
+        #
+        # If this was called by the internal Render thread,
+        # the exception is caught by launch_background_job().
+        #
+        # If /run-task was called manually, the caller gets
+        # the HTTP 500.
+        # ----------------------------------------------------
+
         raise HTTPException(
-            status_code=500,
-            detail=(
-                f"{type(e).__name__}: "
-                f"{e}"
-            )
+            status_code=
+                500,
+
+            detail=
+                (
+                    f"{type(e).__name__}: "
+                    f"{e}"
+                ),
         )
 
 
@@ -1251,27 +1612,36 @@ def run_task(
 # STATUS
 # ============================================================
 
-@app.get("/status/{job_id}")
+@app.get(
+    "/status/{job_id}"
+)
 def job_status(
     job_id: str,
-    sheet_url: str
+    sheet_url: str,
 ):
 
     try:
 
-        # One connection + one exact row read.
         store = JobStore(
             sheet_url,
-            job_id
+            job_id,
         )
 
-        job = store.read()
+        job = (
+            store.read()
+        )
+
+        # ----------------------------------------------------
+        # ERROR CLASSES
+        # ----------------------------------------------------
 
         try:
 
             error_classes = (
                 json.loads(
-                    job["error_classes"]
+                    job[
+                        "error_classes"
+                    ]
                     or "[]"
                 )
             )
@@ -1280,11 +1650,17 @@ def job_status(
 
             error_classes = []
 
+        # ----------------------------------------------------
+        # NO DATA CLASSES
+        # ----------------------------------------------------
+
         try:
 
             no_data_classes = (
                 json.loads(
-                    job["no_data_classes"]
+                    job[
+                        "no_data_classes"
+                    ]
                     or "[]"
                 )
             )
@@ -1293,38 +1669,73 @@ def job_status(
 
             no_data_classes = []
 
+        # ----------------------------------------------------
+        # LOGS
+        # ----------------------------------------------------
+
         logs = (
-            job["logs"].split("\n")
-            if job["logs"]
+            job[
+                "logs"
+            ].split(
+                "\n"
+            )
+
+            if job[
+                "logs"
+            ]
+
             else []
         )
 
+        # ----------------------------------------------------
+        # RESPONSE
+        # ----------------------------------------------------
+
         return {
             "job_id":
-                job["job_id"],
+                job[
+                    "job_id"
+                ],
 
             "status":
-                job["status"],
+                job[
+                    "status"
+                ],
 
             "sheet_name":
-                job["sheet_name"],
+                job[
+                    "sheet_name"
+                ],
 
             "term":
-                job["term"],
+                job[
+                    "term"
+                ],
 
             "concurrency":
-                safe_int(
-                    job["concurrency"]
-                ) or 1,
+                (
+                    safe_int(
+                        job[
+                            "concurrency"
+                        ]
+                    )
+                    or 1
+                ),
 
             "created":
-                job["created"],
+                job[
+                    "created"
+                ],
 
             "started":
-                job["started"],
+                job[
+                    "started"
+                ],
 
             "completed":
-                job["completed"],
+                job[
+                    "completed"
+                ],
 
             "total":
                 safe_int(
@@ -1335,31 +1746,43 @@ def job_status(
 
             "successful":
                 safe_int(
-                    job["successful"]
+                    job[
+                        "successful"
+                    ]
                 ),
 
             "changed":
                 safe_int(
-                    job["changed"]
+                    job[
+                        "changed"
+                    ]
                 ),
 
             "unchanged":
                 safe_int(
-                    job["unchanged"]
+                    job[
+                        "unchanged"
+                    ]
                 ),
 
             "errors":
                 safe_int(
-                    job["errors"]
+                    job[
+                        "errors"
+                    ]
                 ),
 
             "needs_review":
                 safe_int(
-                    job["needs_review"]
+                    job[
+                        "needs_review"
+                    ]
                 ),
 
             "previous_sheet":
-                job["previous_sheet"],
+                job[
+                    "previous_sheet"
+                ],
 
             "error_classes":
                 error_classes,
@@ -1371,40 +1794,75 @@ def job_status(
                 logs,
 
             "fatal_error":
-                job["fatal_error"],
+                job[
+                    "fatal_error"
+                ],
         }
 
     except ValueError as e:
 
         raise HTTPException(
-            status_code=404,
-            detail=str(e)
+            status_code=
+                404,
+
+            detail=
+                str(
+                    e
+                ),
         )
 
     except Exception as e:
 
         print(
             "STATUS ERROR:",
-            repr(e)
+            repr(
+                e
+            ),
         )
 
         raise HTTPException(
-            status_code=500,
-            detail=(
-                f"{type(e).__name__}: "
-                f"{e}"
-            )
+            status_code=
+                500,
+
+            detail=
+                (
+                    f"{type(e).__name__}: "
+                    f"{e}"
+                ),
         )
 
 
 # ============================================================
 # LEGACY SYNCHRONOUS ENDPOINT
+#
+# Retained for testing.
+#
+# The sidebar should use /start, not /run.
 # ============================================================
 
-@app.post("/run")
+@app.post(
+    "/run"
+)
 def run(
-    req: RunRequest
+    req: RunRequest,
 ):
+
+    if req.concurrency not in [
+        1,
+        2,
+        3,
+    ]:
+
+        raise HTTPException(
+            status_code=
+                400,
+
+            detail=
+                (
+                    "Concurrency must be "
+                    "1, 2, or 3."
+                ),
+        )
 
     return run_enrollment(
         sheet_url=
@@ -1417,5 +1875,5 @@ def run(
             req.term,
 
         concurrency=
-            req.concurrency
+            req.concurrency,
     )

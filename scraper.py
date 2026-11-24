@@ -1,19 +1,244 @@
 import asyncio
+import json
+import os
+import random
 import re
+import time
 
 from datetime import datetime
 from itertools import islice
+
+import google.auth
+import gspread
+
+from google.oauth2 import service_account
 
 from playwright.async_api import (
     async_playwright,
     TimeoutError as PlaywrightTimeoutError,
 )
 
-import google.auth
-import gspread
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Render Free is resource constrained.
+#
+# Start with 2 concurrent pages.
+# We can increase this after confirming stability.
+CONCURRENCY = 2
+
+# ASU scraper retry behavior.
+ASU_MAX_ATTEMPTS = 3
+
+# Google Sheets retry behavior.
+GOOGLE_MAX_ATTEMPTS = 6
+
+# Delay between normal batches.
+BATCH_DELAY_MIN = 1.5
+BATCH_DELAY_MAX = 3.0
+
+# Delay before retrying transient scraper failures.
+RETRY_PASS_DELAY = 8
+
+# Only these scraper failures should be retried.
+TRANSIENT_ERROR_TYPES = {
+    "PAGE_TIMEOUT",
+    "ENROLLMENT_DATA_TIMEOUT",
+    "NO_RESPONSE",
+    "TIMEOUT",
+    "HTTP_429",
+    "HTTP_500",
+    "HTTP_502",
+    "HTTP_503",
+    "HTTP_504",
+}
 
 
-CONCURRENCY = 5
+# ============================================================
+# GOOGLE AUTHENTICATION
+# ============================================================
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+def get_google_credentials():
+
+    # --------------------------------------------------------
+    # RENDER
+    #
+    # Render stores the service-account JSON in:
+    #
+    # GOOGLE_SERVICE_ACCOUNT_JSON
+    #
+    # Nothing sensitive is stored in GitHub.
+    # --------------------------------------------------------
+
+    raw_json = os.getenv(
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "",
+    ).strip()
+
+    if raw_json:
+
+        try:
+
+            info = json.loads(
+                raw_json
+            )
+
+        except json.JSONDecodeError as e:
+
+            raise RuntimeError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON "
+                "contains invalid JSON."
+            ) from e
+
+        credentials = (
+            service_account
+            .Credentials
+            .from_service_account_info(
+                info,
+                scopes=GOOGLE_SCOPES,
+            )
+        )
+
+        print(
+            "Google authentication: "
+            "Render service account"
+        )
+
+        print(
+            "Service account:",
+            credentials.service_account_email,
+        )
+
+        return credentials
+
+    # --------------------------------------------------------
+    # GOOGLE CLOUD / CLOUD SHELL FALLBACK
+    # --------------------------------------------------------
+
+    credentials, project = (
+        google.auth.default(
+            scopes=GOOGLE_SCOPES
+        )
+    )
+
+    print(
+        "Google authentication: ADC"
+    )
+
+    print(
+        "ADC project:",
+        project,
+    )
+
+    print(
+        "Credential type:",
+        type(credentials).__name__,
+    )
+
+    print(
+        "Service account:",
+        getattr(
+            credentials,
+            "service_account_email",
+            "unknown",
+        ),
+    )
+
+    return credentials
+
+
+# ============================================================
+# GOOGLE RETRY
+# ============================================================
+
+def is_retryable_google_error(
+    error,
+):
+
+    message = str(
+        error
+    ).lower()
+
+    retryable_patterns = [
+        "429",
+        "quota exceeded",
+        "resource_exhausted",
+        "rate limit",
+        "500",
+        "502",
+        "503",
+        "504",
+        "internal error",
+        "backend error",
+        "service unavailable",
+    ]
+
+    return any(
+        pattern in message
+        for pattern in retryable_patterns
+    )
+
+
+def google_retry(
+    operation,
+    description="Google operation",
+    attempts=GOOGLE_MAX_ATTEMPTS,
+):
+
+    last_error = None
+
+    for attempt in range(
+        1,
+        attempts + 1,
+    ):
+
+        try:
+
+            return operation()
+
+        except Exception as e:
+
+            last_error = e
+
+            if not is_retryable_google_error(
+                e
+            ):
+                raise
+
+            if attempt >= attempts:
+                break
+
+            delay = min(
+                2 ** (attempt - 1),
+                30,
+            )
+
+            delay += random.uniform(
+                0.25,
+                1.25,
+            )
+
+            print(
+                f"{description} failed "
+                f"with temporary Google error. "
+                f"Attempt {attempt}/{attempts}. "
+                f"Retrying in "
+                f"{delay:.1f}s..."
+            )
+
+            time.sleep(
+                delay
+            )
+
+    raise last_error
 
 
 # ============================================================
@@ -22,61 +247,41 @@ CONCURRENCY = 5
 
 def get_sheet(
     sheet_url,
-    sheet_name
+    sheet_name,
 ):
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
-    credentials, project = (
-        google.auth.default(
-            scopes=scopes
-        )
-    )
-
-    print(
-        "ADC project:",
-        project
-    )
-
-    print(
-        "Credential type:",
-        type(credentials).__name__
-    )
-
-    print(
-        "Service account:",
-        getattr(
-            credentials,
-            "service_account_email",
-            "unknown"
-        )
+    credentials = (
+        get_google_credentials()
     )
 
     gc = gspread.authorize(
         credentials
     )
 
-    spreadsheet = gc.open_by_url(
-        sheet_url
+    spreadsheet = google_retry(
+        lambda:
+            gc.open_by_url(
+                sheet_url
+            ),
+        "Open spreadsheet",
     )
 
     print(
         "Spreadsheet opened:",
-        spreadsheet.title
+        spreadsheet.title,
     )
 
-    worksheet = (
-        spreadsheet.worksheet(
-            sheet_name
-        )
+    worksheet = google_retry(
+        lambda:
+            spreadsheet.worksheet(
+                sheet_name
+            ),
+        "Open worksheet",
     )
 
     print(
         "Worksheet opened:",
-        worksheet.title
+        worksheet.title,
     )
 
     return worksheet
@@ -87,14 +292,14 @@ def get_sheet(
 # ============================================================
 
 def parse_sheet_date(
-    sheet_name
+    sheet_name,
 ):
 
     try:
 
         return datetime.strptime(
             sheet_name,
-            "%m/%d"
+            "%m/%d",
         ).replace(
             year=datetime.now().year
         )
@@ -106,7 +311,7 @@ def parse_sheet_date(
 
 def get_previous_run_sheet(
     spreadsheet,
-    current_sheet_name
+    current_sheet_name,
 ):
 
     current_date = (
@@ -125,11 +330,15 @@ def get_previous_run_sheet(
 
         return None
 
+    worksheets = google_retry(
+        lambda:
+            spreadsheet.worksheets(),
+        "List worksheets",
+    )
+
     candidates = []
 
-    for worksheet in (
-        spreadsheet.worksheets()
-    ):
+    for worksheet in worksheets:
 
         name = worksheet.title
 
@@ -140,7 +349,10 @@ def get_previous_run_sheet(
         ]:
             continue
 
-        if name == current_sheet_name:
+        if (
+            name ==
+            current_sheet_name
+        ):
             continue
 
         sheet_date = (
@@ -151,13 +363,14 @@ def get_previous_run_sheet(
 
         if (
             sheet_date and
-            sheet_date < current_date
+            sheet_date <
+            current_date
         ):
 
             candidates.append(
                 (
                     sheet_date,
-                    worksheet
+                    worksheet,
                 )
             )
 
@@ -173,7 +386,7 @@ def get_previous_run_sheet(
     candidates.sort(
         key=lambda item:
             item[0],
-        reverse=True
+        reverse=True,
     )
 
     previous_sheet = (
@@ -182,7 +395,7 @@ def get_previous_run_sheet(
 
     print(
         "Previous enrollment run:",
-        previous_sheet.title
+        previous_sheet.title,
     )
 
     return previous_sheet
@@ -193,14 +406,17 @@ def get_previous_run_sheet(
 # ============================================================
 
 def build_previous_lookup(
-    previous_sheet
+    previous_sheet,
 ):
 
     if previous_sheet is None:
         return {}
 
-    values = (
-        previous_sheet.get_all_values()
+    values = google_retry(
+        lambda:
+            previous_sheet
+            .get_all_values(),
+        "Read previous enrollment run",
     )
 
     lookup = {}
@@ -260,20 +476,17 @@ def build_previous_lookup(
 
 # ============================================================
 # CURRENT DAILY SHEET LOOKUP
-#
-# Build row numbers once. Do not scan the whole worksheet
-# again for every batch.
 # ============================================================
 
 def build_daily_row_lookup(
-    all_values
+    all_values,
 ):
 
     lookup = {}
 
     for row_number, row in enumerate(
         all_values[1:],
-        start=2
+        start=2,
     ):
 
         if len(row) <= 2:
@@ -301,13 +514,83 @@ def build_daily_row_lookup(
 
 
 # ============================================================
-# SCRAPER
+# SCRAPER RESULT HELPERS
 # ============================================================
 
-async def scrape_class(
+def scraper_error(
+    class_num,
+    error_type,
+    error,
+):
+
+    return {
+        "class_num":
+            str(class_num),
+
+        "status":
+            "ERROR",
+
+        "error_type":
+            error_type,
+
+        "error":
+            str(error),
+    }
+
+
+def scraper_no_data(
+    class_num,
+    error_type,
+    error,
+):
+
+    return {
+        "class_num":
+            str(class_num),
+
+        "status":
+            "NO_DATA",
+
+        "error_type":
+            error_type,
+
+        "error":
+            str(error),
+    }
+
+
+def is_transient_result(
+    result,
+):
+
+    if (
+        result.get(
+            "status"
+        ) != "ERROR"
+    ):
+        return False
+
+    error_type = str(
+        result.get(
+            "error_type",
+            "",
+        )
+    ).upper()
+
+    return (
+        error_type
+        in TRANSIENT_ERROR_TYPES
+    )
+
+
+# ============================================================
+# SCRAPE ONE CLASS
+# ============================================================
+
+async def scrape_class_once(
     context,
     class_num,
-    term
+    term,
 ):
 
     page = await context.new_page()
@@ -340,41 +623,70 @@ async def scrape_class(
 
         try:
 
-            await page.goto(
+            response = await page.goto(
                 url,
                 timeout=30000,
-                wait_until="load"
+                wait_until="load",
             )
 
         except PlaywrightTimeoutError:
 
-            return {
-                "class_num":
-                    class_num,
-
-                "status":
-                    "ERROR",
-
-                "error_type":
-                    "PAGE_TIMEOUT",
-
-                "error":
-                    (
-                        "ASU page did not "
-                        "finish loading within "
-                        "30 seconds."
-                    ),
-            }
+            return scraper_error(
+                class_num,
+                "PAGE_TIMEOUT",
+                (
+                    "ASU page did not "
+                    "finish loading within "
+                    "30 seconds."
+                ),
+            )
 
         # ----------------------------------------------------
-        # WAIT FOR DATA
+        # HTTP STATUS
+        # ----------------------------------------------------
+
+        if response:
+
+            status_code = (
+                response.status
+            )
+
+            if status_code == 429:
+
+                return scraper_error(
+                    class_num,
+                    "HTTP_429",
+                    (
+                        "ASU returned HTTP 429 "
+                        "Too Many Requests."
+                    ),
+                )
+
+            if status_code in [
+                500,
+                502,
+                503,
+                504,
+            ]:
+
+                return scraper_error(
+                    class_num,
+                    f"HTTP_{status_code}",
+                    (
+                        "ASU returned temporary "
+                        f"HTTP {status_code}."
+                    ),
+                )
+
+        # ----------------------------------------------------
+        # WAIT FOR ENROLLMENT DATA
         # ----------------------------------------------------
 
         try:
 
             await page.wait_for_selector(
                 "text=Open Seats",
-                timeout=35000
+                timeout=35000,
             )
 
         except PlaywrightTimeoutError:
@@ -390,7 +702,7 @@ async def scrape_class(
                 body_text = re.sub(
                     r"\s+",
                     " ",
-                    body_text
+                    body_text,
                 ).strip()
 
             except Exception:
@@ -399,22 +711,14 @@ async def scrape_class(
 
             if not body_text:
 
-                return {
-                    "class_num":
-                        class_num,
-
-                    "status":
-                        "ERROR",
-
-                    "error_type":
-                        "NO_RESPONSE",
-
-                    "error":
-                        (
-                            "ASU returned no "
-                            "usable page content."
-                        ),
-                }
+                return scraper_error(
+                    class_num,
+                    "NO_RESPONSE",
+                    (
+                        "ASU returned no "
+                        "usable page content."
+                    ),
+                )
 
             not_found_patterns = [
                 "No classes found",
@@ -432,40 +736,24 @@ async def scrape_class(
 
             if not_found:
 
-                return {
-                    "class_num":
-                        class_num,
-
-                    "status":
-                        "NO_DATA",
-
-                    "error_type":
-                        "CLASS_NOT_FOUND",
-
-                    "error":
-                        (
-                            "ASU did not return "
-                            "a matching class."
-                        ),
-                }
-
-            return {
-                "class_num":
+                return scraper_no_data(
                     class_num,
-
-                "status":
-                    "ERROR",
-
-                "error_type":
-                    "ENROLLMENT_DATA_TIMEOUT",
-
-                "error":
+                    "CLASS_NOT_FOUND",
                     (
-                        "ASU page loaded, but "
-                        "enrollment data was not "
-                        "available within 35 seconds."
+                        "ASU did not return "
+                        "a matching class."
                     ),
-            }
+                )
+
+            return scraper_error(
+                class_num,
+                "ENROLLMENT_DATA_TIMEOUT",
+                (
+                    "ASU page loaded, but "
+                    "enrollment data was not "
+                    "available within 35 seconds."
+                ),
+            )
 
         # ----------------------------------------------------
         # BODY
@@ -480,7 +768,7 @@ async def scrape_class(
         text_content = re.sub(
             r"\s+",
             " ",
-            text_content
+            text_content,
         ).strip()
 
         # ----------------------------------------------------
@@ -491,7 +779,7 @@ async def scrape_class(
             rf"{re.escape(class_num)}\s+"
             r"([A-Z][a-z]+"
             r"(?:\s[A-Z][a-z]+)*)",
-            text_content
+            text_content,
         )
 
         instructor = (
@@ -508,28 +796,20 @@ async def scrape_class(
 
         seats_matches = re.findall(
             r"(\d+)\s+of\s+(\d+)",
-            text_content
+            text_content,
         )
 
         if not seats_matches:
 
-            return {
-                "class_num":
-                    class_num,
-
-                "status":
-                    "NO_DATA",
-
-                "error_type":
-                    "NO_ENROLLMENT_DATA",
-
-                "error":
-                    (
-                        "Class page was found, "
-                        "but enrollment values "
-                        "were not found."
-                    ),
-            }
+            return scraper_no_data(
+                class_num,
+                "NO_ENROLLMENT_DATA",
+                (
+                    "Class page was found, "
+                    "but enrollment values "
+                    "were not found."
+                ),
+            )
 
         open_seats, enroll_cap = (
             seats_matches[-1]
@@ -581,19 +861,11 @@ async def scrape_class(
             f"{e}"
         )
 
-        return {
-            "class_num":
-                class_num,
-
-            "status":
-                "ERROR",
-
-            "error_type":
-                "TIMEOUT",
-
-            "error":
-                str(e),
-        }
+        return scraper_error(
+            class_num,
+            "TIMEOUT",
+            str(e),
+        )
 
     except Exception as e:
 
@@ -603,26 +875,91 @@ async def scrape_class(
             f"{e}"
         )
 
-        return {
-            "class_num":
-                class_num,
-
-            "status":
-                "ERROR",
-
-            "error_type":
-                type(e).__name__,
-
-            "error":
-                str(e),
-        }
+        return scraper_error(
+            class_num,
+            type(e).__name__,
+            str(e),
+        )
 
     finally:
 
         try:
+
             await page.close()
+
         except Exception:
+
             pass
+
+
+# ============================================================
+# SCRAPE CLASS WITH RETRIES
+# ============================================================
+
+async def scrape_class(
+    context,
+    class_num,
+    term,
+    max_attempts=ASU_MAX_ATTEMPTS,
+):
+
+    last_result = None
+
+    for attempt in range(
+        1,
+        max_attempts + 1,
+    ):
+
+        result = await scrape_class_once(
+            context,
+            class_num,
+            term,
+        )
+
+        last_result = result
+
+        # Success or confirmed no-data does not retry.
+        if (
+            result.get("status")
+            in [
+                "SUCCESS",
+                "NO_DATA",
+            ]
+        ):
+            return result
+
+        if not is_transient_result(
+            result
+        ):
+            return result
+
+        if attempt >= max_attempts:
+            break
+
+        delay = min(
+            2 ** (attempt - 1),
+            8,
+        )
+
+        delay += random.uniform(
+            0.5,
+            1.5,
+        )
+
+        print(
+            f"{class_num}: temporary "
+            f"{result.get('error_type')} "
+            f"on attempt "
+            f"{attempt}/{max_attempts}. "
+            f"Retrying in "
+            f"{delay:.1f}s..."
+        )
+
+        await asyncio.sleep(
+            delay
+        )
+
+    return last_result
 
 
 # ============================================================
@@ -630,7 +967,7 @@ async def scrape_class(
 # ============================================================
 
 def split_instructor(
-    instructor
+    instructor,
 ):
 
     if not instructor:
@@ -656,7 +993,7 @@ def split_instructor(
 
         return (
             last_name,
-            first_name
+            first_name,
         )
 
     return "", instructor
@@ -670,7 +1007,7 @@ def update_batch(
     sheet,
     batch_results,
     previous_lookup,
-    daily_lookup
+    daily_lookup,
 ):
 
     updates = []
@@ -731,7 +1068,7 @@ def update_batch(
         previous = (
             previous_lookup.get(
                 class_num,
-                {}
+                {},
             )
         )
 
@@ -750,13 +1087,13 @@ def update_batch(
                 "error_type":
                     result.get(
                         "error_type",
-                        "UNKNOWN_ERROR"
+                        "UNKNOWN_ERROR",
                     ),
 
                 "error":
                     result.get(
                         "error",
-                        "Unknown scraper error."
+                        "Unknown scraper error.",
                     ),
             }
 
@@ -787,13 +1124,13 @@ def update_batch(
                 "error_type":
                     result.get(
                         "error_type",
-                        "NO_DATA"
+                        "NO_DATA",
                     ),
 
                 "error":
                     result.get(
                         "error",
-                        "No data returned."
+                        "No data returned.",
                     ),
             }
 
@@ -817,7 +1154,7 @@ def update_batch(
             split_instructor(
                 result.get(
                     "instructor",
-                    ""
+                    "",
                 )
             )
         )
@@ -832,7 +1169,7 @@ def update_batch(
                         "last_name",
                         row_data[4]
                         if len(row_data) > 4
-                        else ""
+                        else "",
                     )
                 ),
 
@@ -844,7 +1181,7 @@ def update_batch(
                         "first_name",
                         row_data[5]
                         if len(row_data) > 5
-                        else ""
+                        else "",
                     )
                 ),
 
@@ -871,7 +1208,7 @@ def update_batch(
                     "last_name",
                     row_data[4]
                     if len(row_data) > 4
-                    else ""
+                    else "",
                 ),
 
             "first_name":
@@ -879,7 +1216,7 @@ def update_batch(
                     "first_name",
                     row_data[5]
                     if len(row_data) > 5
-                    else ""
+                    else "",
                 ),
 
             "cap":
@@ -887,7 +1224,7 @@ def update_batch(
                     "cap",
                     row_data[7]
                     if len(row_data) > 7
-                    else ""
+                    else "",
                 ),
 
             "open":
@@ -895,7 +1232,7 @@ def update_batch(
                     "open",
                     row_data[8]
                     if len(row_data) > 8
-                    else ""
+                    else "",
                 ),
 
             "current":
@@ -903,7 +1240,7 @@ def update_batch(
                     "current",
                     row_data[9]
                     if len(row_data) > 9
-                    else ""
+                    else "",
                 ),
         }
 
@@ -933,7 +1270,7 @@ def update_batch(
                 "previous_amount",
                 row_data[6]
                 if len(row_data) > 6
-                else ""
+                else "",
             )
         )
 
@@ -968,11 +1305,10 @@ def update_batch(
 
             "values": [
                 new_row_values
-            ]
+            ],
         })
 
-        # Update the in-memory daily row too.
-        # This keeps subsequent logic consistent.
+        # Keep in-memory row synchronized.
         while len(row_data) < 10:
             row_data.append("")
 
@@ -981,7 +1317,7 @@ def update_batch(
         )
 
     # --------------------------------------------------------
-    # COMMIT THIS BATCH
+    # COMMIT BATCH
     # --------------------------------------------------------
 
     if updates:
@@ -992,8 +1328,12 @@ def update_batch(
             "current batch..."
         )
 
-        sheet.batch_update(
-            updates
+        google_retry(
+            lambda:
+                sheet.batch_update(
+                    updates
+                ),
+            "Batch enrollment update",
         )
 
         print(
@@ -1022,6 +1362,29 @@ def update_batch(
 
 
 # ============================================================
+# PROCESS ONE SCRAPER BATCH
+# ============================================================
+
+async def process_scrape_batch(
+    context,
+    batch,
+    term,
+):
+
+    return await asyncio.gather(
+        *[
+            scrape_class(
+                context,
+                class_num,
+                term,
+            )
+            for class_num
+            in batch
+        ]
+    )
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -1030,8 +1393,40 @@ async def main(
     sheet_name,
     term,
     concurrency=CONCURRENCY,
-    progress_callback=None
+    progress_callback=None,
 ):
+
+    # --------------------------------------------------------
+    # NORMALIZE CONCURRENCY
+    # --------------------------------------------------------
+
+    try:
+
+        concurrency = int(
+            concurrency
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        concurrency = (
+            CONCURRENCY
+        )
+
+    concurrency = max(
+        1,
+        min(
+            concurrency,
+            3,
+        ),
+    )
+
+    print(
+        "Enrollment concurrency:",
+        concurrency,
+    )
 
     # --------------------------------------------------------
     # SHEET
@@ -1039,7 +1434,7 @@ async def main(
 
     sheet = get_sheet(
         sheet_url,
-        sheet_name
+        sheet_name,
     )
 
     spreadsheet = (
@@ -1053,7 +1448,7 @@ async def main(
     previous_sheet = (
         get_previous_run_sheet(
             spreadsheet,
-            sheet_name
+            sheet_name,
         )
     )
 
@@ -1067,8 +1462,10 @@ async def main(
     # CURRENT DATA
     # --------------------------------------------------------
 
-    all_values = (
-        sheet.get_all_values()
+    all_values = google_retry(
+        lambda:
+            sheet.get_all_values(),
+        "Read current enrollment sheet",
     )
 
     daily_lookup = (
@@ -1091,6 +1488,7 @@ async def main(
     # --------------------------------------------------------
 
     seen = set()
+
     class_nums = []
 
     for class_num in (
@@ -1154,7 +1552,7 @@ async def main(
         })
 
     # --------------------------------------------------------
-    # CUMULATIVE COUNTS
+    # CUMULATIVE STATE
     # --------------------------------------------------------
 
     all_results = []
@@ -1175,7 +1573,12 @@ async def main(
 
         browser = (
             await p.chromium.launch(
-                headless=True
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
             )
         )
 
@@ -1208,16 +1611,24 @@ async def main(
                             ),
 
                         "processed":
-                            len(all_results),
+                            len(
+                                all_results
+                            ),
 
                         "total":
-                            len(class_nums),
+                            len(
+                                class_nums
+                            ),
                     })
+
+                # --------------------------------------------
+                # NEXT BATCH
+                # --------------------------------------------
 
                 batch = list(
                     islice(
                         iterator,
-                        concurrency
+                        concurrency,
                     )
                 )
 
@@ -1242,10 +1653,14 @@ async def main(
                             ),
 
                         "processed":
-                            len(all_results),
+                            len(
+                                all_results
+                            ),
 
                         "total":
-                            len(class_nums),
+                            len(
+                                class_nums
+                            ),
                     })
 
                 # --------------------------------------------
@@ -1253,16 +1668,10 @@ async def main(
                 # --------------------------------------------
 
                 batch_results = (
-                    await asyncio.gather(
-                        *[
-                            scrape_class(
-                                context,
-                                class_num,
-                                term
-                            )
-                            for class_num
-                            in batch
-                        ]
+                    await process_scrape_batch(
+                        context,
+                        batch,
+                        term,
                     )
                 )
 
@@ -1271,7 +1680,7 @@ async def main(
                 )
 
                 # --------------------------------------------
-                # WRITE BATCH TO DAILY SHEET NOW
+                # WRITE BATCH
                 # --------------------------------------------
 
                 batch_summary = (
@@ -1279,7 +1688,7 @@ async def main(
                         sheet,
                         batch_results,
                         previous_lookup,
-                        daily_lookup
+                        daily_lookup,
                     )
                 )
 
@@ -1324,7 +1733,9 @@ async def main(
                     for result
                     in all_results
                     if (
-                        result["status"] ==
+                        result[
+                            "status"
+                        ] ==
                         "SUCCESS"
                     )
                 )
@@ -1352,10 +1763,14 @@ async def main(
                             batch,
 
                         "processed":
-                            len(all_results),
+                            len(
+                                all_results
+                            ),
 
                         "total":
-                            len(class_nums),
+                            len(
+                                class_nums
+                            ),
 
                         "successful":
                             successful_so_far,
@@ -1375,6 +1790,30 @@ async def main(
                         "results":
                             batch_results,
                     })
+
+                # --------------------------------------------
+                # SMALL DELAY BETWEEN BATCHES
+                # --------------------------------------------
+
+                if (
+                    len(all_results) <
+                    len(class_nums)
+                ):
+
+                    delay = random.uniform(
+                        BATCH_DELAY_MIN,
+                        BATCH_DELAY_MAX,
+                    )
+
+                    print(
+                        "Waiting "
+                        f"{delay:.1f}s "
+                        "before next batch."
+                    )
+
+                    await asyncio.sleep(
+                        delay
+                    )
 
         finally:
 
@@ -1437,6 +1876,11 @@ async def main(
     )
 
     print(
+        f"Duplicates skipped: "
+        f"{duplicate_count}"
+    )
+
+    print(
         "========================================"
     )
 
@@ -1454,10 +1898,14 @@ async def main(
                 "Enrollment run complete.",
 
             "processed":
-                len(all_results),
+                len(
+                    all_results
+                ),
 
             "total":
-                len(class_nums),
+                len(
+                    class_nums
+                ),
 
             "successful":
                 successful,
@@ -1484,7 +1932,9 @@ async def main(
             "success",
 
         "classes_processed":
-            len(all_results),
+            len(
+                all_results
+            ),
 
         "successful":
             successful,
@@ -1531,7 +1981,7 @@ def run_enrollment(
     sheet_name,
     term,
     concurrency=CONCURRENCY,
-    progress_callback=None
+    progress_callback=None,
 ):
 
     return asyncio.run(
@@ -1540,6 +1990,6 @@ def run_enrollment(
             sheet_name,
             term,
             concurrency,
-            progress_callback
+            progress_callback,
         )
     )
