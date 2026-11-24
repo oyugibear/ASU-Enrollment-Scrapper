@@ -1882,9 +1882,7 @@ def run(
             req.concurrency,
     )
 
-@app.get(
-    "/diagnose-asu"
-)
+@app.get("/diagnose-asu")
 def diagnose_asu():
 
     import asyncio
@@ -1896,10 +1894,4 @@ def diagnose_asu():
         )
     )
 
-    return {
-        "ok":
-            True,
-
-        "requests":
-            result,
-    }
+    return result

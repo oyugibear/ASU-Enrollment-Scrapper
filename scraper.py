@@ -2451,6 +2451,10 @@ async def diagnose_asu_api(
 
     async with async_playwright() as p:
 
+        # ====================================================
+        # START BROWSER
+        # ====================================================
+
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -2460,14 +2464,24 @@ async def diagnose_asu_api(
             ],
         )
 
-        context = await browser.new_context()
+        context = (
+            await browser.new_context()
+        )
 
-        page = await context.new_page()
-
-        captured = []
+        page = (
+            await context.new_page()
+        )
 
         # ====================================================
-        # REQUEST
+        # CAPTURED DATA
+        # ====================================================
+
+        captured_requests = []
+
+        class_api_responses = []
+
+        # ====================================================
+        # REQUEST HANDLER
         # ====================================================
 
         async def handle_request(
@@ -2478,82 +2492,101 @@ async def diagnose_asu_api(
 
             if (
                 "catalog-microservices"
-                in url
+                not in url
             ):
+                return
 
-                print(
-                    "\n========== ASU API REQUEST =========="
-                )
+            print(
+                "\n"
+                "========== ASU API REQUEST =========="
+            )
 
-                print(
-                    "METHOD:",
-                    request.method,
-                )
+            print(
+                "METHOD:",
+                request.method,
+            )
 
-                print(
-                    "URL:",
-                    url,
-                )
+            print(
+                "URL:",
+                url,
+            )
+
+            # ------------------------------------------------
+            # SAFE HEADERS
+            # ------------------------------------------------
+
+            try:
 
                 headers = (
-                    await request.all_headers()
+                    await request
+                    .all_headers()
                 )
 
-                safe_headers = {}
+            except Exception:
 
-                for key, value in (
-                    headers.items()
-                ):
+                headers = {}
 
-                    # Do NOT print authentication
-                    # credentials into Render logs.
-                    if key.lower() in [
-                        "authorization",
-                        "cookie",
-                    ]:
+            safe_headers = {}
 
-                        safe_headers[key] = (
-                            "[REDACTED]"
-                        )
+            for key, value in (
+                headers.items()
+            ):
 
-                    else:
-
-                        safe_headers[key] = (
-                            value
-                        )
-
-                print(
-                    "HEADERS:",
-                    safe_headers,
+                key_lower = (
+                    key.lower()
                 )
 
-                captured.append({
-                    "method":
-                        request.method,
+                # Never print auth/session credentials.
+                if key_lower in [
+                    "authorization",
+                    "cookie",
+                    "set-cookie",
+                ]:
 
-                    "url":
-                        url,
-                })
+                    safe_headers[
+                        key
+                    ] = "[REDACTED]"
+
+                else:
+
+                    safe_headers[
+                        key
+                    ] = value
+
+            print(
+                "HEADERS:",
+                safe_headers,
+            )
+
+            captured_requests.append({
+                "method":
+                    request.method,
+
+                "url":
+                    url,
+            })
 
         # ====================================================
-        # RESPONSE
+        # RESPONSE HANDLER
         # ====================================================
 
         async def handle_response(
             response,
         ):
 
-            url = response.url
+            url = (
+                response.url
+            )
 
             if (
                 "catalog-microservices"
                 not in url
             ):
-
                 return
 
             print(
-                "\n========== ASU API RESPONSE =========="
+                "\n"
+                "========== ASU API RESPONSE =========="
             )
 
             print(
@@ -2566,12 +2599,26 @@ async def diagnose_asu_api(
                 url,
             )
 
+            # ------------------------------------------------
+            # RESPONSE HEADERS
+            # ------------------------------------------------
+
+            try:
+
+                headers = (
+                    await response
+                    .all_headers()
+                )
+
+            except Exception:
+
+                headers = {}
+
             content_type = (
-                await response
-                .all_headers()
-            ).get(
-                "content-type",
-                "",
+                headers.get(
+                    "content-type",
+                    "",
+                )
             )
 
             print(
@@ -2579,12 +2626,19 @@ async def diagnose_asu_api(
                 content_type,
             )
 
-            if (
-                "application/json"
-                not in content_type
-            ):
+            # ------------------------------------------------
+            # WE ONLY CARE ABOUT /search/classes
+            # ------------------------------------------------
 
+            if (
+                "/search/classes"
+                not in url
+            ):
                 return
+
+            # ------------------------------------------------
+            # PARSE JSON
+            # ------------------------------------------------
 
             try:
 
@@ -2592,123 +2646,252 @@ async def diagnose_asu_api(
                     await response.json()
                 )
 
-                # Only print structural information,
-                # not an enormous response.
+            except Exception as e:
+
+                print(
+                    "FAILED TO PARSE "
+                    "CLASS API JSON:",
+                    type(e).__name__,
+                    str(e),
+                )
+
+                class_api_responses.append({
+                    "url":
+                        url,
+
+                    "status":
+                        response.status,
+
+                    "error":
+                        (
+                            f"{type(e).__name__}: "
+                            f"{e}"
+                        ),
+                })
+
+                return
+
+            # ------------------------------------------------
+            # STORE COMPLETE RESPONSE
+            # ------------------------------------------------
+
+            class_api_responses.append({
+                "url":
+                    url,
+
+                "status":
+                    response.status,
+
+                "data":
+                    data,
+            })
+
+            # =================================================
+            # DIAGNOSTIC OUTPUT
+            # =================================================
+
+            print(
+                "\n"
+                "========== CLASS API DATA =========="
+            )
+
+            print(
+                "RESPONSE TYPE:",
+                type(data).__name__,
+            )
+
+            # ------------------------------------------------
+            # DICT RESPONSE
+            # ------------------------------------------------
+
+            if isinstance(
+                data,
+                dict,
+            ):
+
+                print(
+                    "TOP LEVEL KEYS:",
+                    list(
+                        data.keys()
+                    ),
+                )
+
+                # --------------------------------------------
+                # CLASSES
+                # --------------------------------------------
+
+                classes = (
+                    data.get(
+                        "classes"
+                    )
+                )
 
                 if isinstance(
-                    data,
-                    dict,
+                    classes,
+                    list,
                 ):
 
                     print(
-                        "TOP LEVEL KEYS:",
-                        list(
-                            data.keys()
+                        "CLASS COUNT:",
+                        len(
+                            classes
                         ),
                     )
 
-                    classes = (
-                        data.get(
-                            "classes"
-                        )
-                    )
-
-                    if (
-                        isinstance(
-                            classes,
-                            list,
-                        )
-                        and
-                        classes
-                    ):
-
-                        print(
-                            "CLASS COUNT:",
-                            len(
-                                classes
-                            ),
-                        )
+                    if classes:
 
                         first = (
                             classes[0]
                         )
 
                         print(
-                            "FIRST CLASS KEYS:",
-                            list(
-                                first.keys()
-                            )
-                            if isinstance(
-                                first,
-                                dict,
-                            )
-                            else type(
+                            "FIRST CLASS TYPE:",
+                            type(
                                 first
                             ).__name__,
                         )
 
-                        if (
-                            isinstance(
-                                first,
-                                dict,
-                            )
-                            and
-                            isinstance(
-                                first.get(
-                                    "CLAS"
-                                ),
-                                dict,
-                            )
+                        if isinstance(
+                            first,
+                            dict,
                         ):
 
-                            clas = (
-                                first[
-                                    "CLAS"
-                                ]
-                            )
-
                             print(
-                                "CLAS KEYS:",
+                                "FIRST CLASS KEYS:",
                                 list(
-                                    clas.keys()
+                                    first.keys()
                                 ),
                             )
 
-                            # Only expose the fields
-                            # useful to our scraper.
+                            # =================================
+                            # CLAS OBJECT
+                            # =================================
 
-                            interesting = {}
-
-                            for key in [
-                                "CLASSNBR",
-                                "SUBJECT",
-                                "CATALOGNBR",
-                                "ENRLCAP",
-                                "ENRLTOT",
-                            ]:
-
-                                if key in clas:
-
-                                    interesting[
-                                        key
-                                    ] = (
-                                        clas[
-                                            key
-                                        ]
-                                    )
-
-                            print(
-                                "INTERESTING:",
-                                interesting,
+                            clas = (
+                                first.get(
+                                    "CLAS"
+                                )
                             )
 
-            except Exception as e:
+                            if isinstance(
+                                clas,
+                                dict,
+                            ):
+
+                                print(
+                                    "CLAS KEYS:",
+                                    list(
+                                        clas.keys()
+                                    ),
+                                )
+
+                                interesting = {}
+
+                                # Try several likely ASU field
+                                # names so the diagnostic tells
+                                # us exactly what is available.
+                                interesting_fields = [
+                                    "CLASSNBR",
+                                    "CLASS_NBR",
+                                    "SUBJECT",
+                                    "CATALOGNBR",
+                                    "CATALOG_NBR",
+                                    "ENRLCAP",
+                                    "ENRL_CAP",
+                                    "ENRLTOT",
+                                    "ENRL_TOT",
+                                    "ENROLLMENT_TOTAL",
+                                    "OPEN_SEATS",
+                                    "SSR_COMPONENT",
+                                    "SESSION_CODE",
+                                ]
+
+                                for field in (
+                                    interesting_fields
+                                ):
+
+                                    if field in clas:
+
+                                        interesting[
+                                            field
+                                        ] = (
+                                            clas[
+                                                field
+                                            ]
+                                        )
+
+                                print(
+                                    "INTERESTING CLAS FIELDS:",
+                                    interesting,
+                                )
+
+                            # =================================
+                            # OTHER NESTED OBJECTS
+                            # =================================
+
+                            for key, value in (
+                                first.items()
+                            ):
+
+                                if isinstance(
+                                    value,
+                                    dict,
+                                ):
+
+                                    print(
+                                        f"{key} KEYS:",
+                                        list(
+                                            value.keys()
+                                        ),
+                                    )
+
+                                elif isinstance(
+                                    value,
+                                    list,
+                                ):
+
+                                    print(
+                                        f"{key}: LIST "
+                                        f"({len(value)} items)"
+                                    )
+
+            # ------------------------------------------------
+            # LIST RESPONSE
+            # ------------------------------------------------
+
+            elif isinstance(
+                data,
+                list,
+            ):
 
                 print(
-                    "JSON INSPECTION ERROR:",
-                    type(e).__name__,
-                    str(e),
+                    "TOP LEVEL LIST LENGTH:",
+                    len(
+                        data
+                    ),
                 )
+
+                if data:
+
+                    first = (
+                        data[0]
+                    )
+
+                    if isinstance(
+                        first,
+                        dict,
+                    ):
+
+                        print(
+                            "FIRST ITEM KEYS:",
+                            list(
+                                first.keys()
+                            ),
+                        )
+
+        # ====================================================
+        # REGISTER NETWORK LISTENERS
+        # ====================================================
 
         page.on(
             "request",
@@ -2721,7 +2904,7 @@ async def diagnose_asu_api(
         )
 
         # ====================================================
-        # CLASS SEARCH
+        # OPEN NORMAL ASU CLASS SEARCH
         # ====================================================
 
         url = (
@@ -2737,27 +2920,108 @@ async def diagnose_asu_api(
         )
 
         print(
-            "\nOpening:",
-            url,
-        )
-
-        await page.goto(
-            url,
-            timeout=60000,
-            wait_until="domcontentloaded",
-        )
-
-        # Give the SPA time to make API requests.
-        await page.wait_for_timeout(
-            15000
+            "\nOpening ASU Class Search:"
         )
 
         print(
-            "\nCaptured "
-            f"{len(captured)} "
-            "catalog API request(s)."
+            url
         )
+
+        try:
+
+            await page.goto(
+                url,
+                timeout=60000,
+                wait_until="domcontentloaded",
+            )
+
+        except PlaywrightTimeoutError:
+
+            print(
+                "Initial page navigation timed out. "
+                "Continuing to wait for API traffic."
+            )
+
+        # ====================================================
+        # WAIT FOR /search/classes RESPONSE
+        # ====================================================
+
+        # The SPA makes several startup requests:
+        #
+        # /appsettings
+        # /classes
+        # /terms
+        # /subjects
+        #
+        # Give it enough time to finish those requests.
+
+        for _ in range(
+            30
+        ):
+
+            if (
+                class_api_responses
+            ):
+                break
+
+            await page.wait_for_timeout(
+                500
+            )
+
+        # Small additional delay so any response handler
+        # still executing can finish.
+
+        await page.wait_for_timeout(
+            1000
+        )
+
+        # ====================================================
+        # SUMMARY
+        # ====================================================
+
+        print(
+            "\n"
+            "========== DIAGNOSTIC SUMMARY =========="
+        )
+
+        print(
+            "Catalog requests captured:",
+            len(
+                captured_requests
+            ),
+        )
+
+        print(
+            "Class API responses captured:",
+            len(
+                class_api_responses
+            ),
+        )
+
+        # ====================================================
+        # CLOSE
+        # ====================================================
 
         await browser.close()
 
-        return captured
+        # ====================================================
+        # RETURN EVERYTHING NEEDED FOR ANALYSIS
+        # ====================================================
+
+        return {
+            "class_num":
+                str(
+                    class_num
+                ),
+
+            "term":
+                str(
+                    term
+                ),
+
+            "requests":
+                captured_requests,
+
+            "class_api":
+                class_api_responses,
+        }
