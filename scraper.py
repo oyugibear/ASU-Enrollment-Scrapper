@@ -23,26 +23,16 @@ from playwright.async_api import (
 # CONFIGURATION
 # ============================================================
 
-# Render Free is resource constrained.
-#
-# Start with 2 concurrent pages.
-# We can increase this after confirming stability.
 CONCURRENCY = 2
 
-# ASU scraper retry behavior.
 ASU_MAX_ATTEMPTS = 3
 
-# Google Sheets retry behavior.
 GOOGLE_MAX_ATTEMPTS = 6
 
-# Delay between normal batches.
 BATCH_DELAY_MIN = 1.5
 BATCH_DELAY_MAX = 3.0
 
-# Delay before retrying transient scraper failures.
-RETRY_PASS_DELAY = 8
 
-# Only these scraper failures should be retried.
 TRANSIENT_ERROR_TYPES = {
     "PAGE_TIMEOUT",
     "ENROLLMENT_DATA_TIMEOUT",
@@ -57,6 +47,42 @@ TRANSIENT_ERROR_TYPES = {
 
 
 # ============================================================
+# EA DAILY SHEET STRUCTURE
+#
+# A = Subject
+# B = Catalog Num
+# C = Class Num
+# D = Title
+# E = Instructor Last Name
+# F = Instructor First Name
+# G = Previous Amount
+# H = Enroll Cap
+# I = Open Seats
+# J = Current
+# K = Update
+# L = Previous enrollment capacity
+# M = Enroll Desc
+# ============================================================
+
+COL_CLASS_NUM = 2
+
+COL_INSTRUCTOR_LAST = 4
+COL_INSTRUCTOR_FIRST = 5
+
+COL_PREVIOUS_AMOUNT = 6
+
+COL_ENROLL_CAP = 7
+COL_OPEN_SEATS = 8
+COL_CURRENT = 9
+
+COL_UPDATE = 10
+
+COL_PREVIOUS_CAPACITY = 11
+
+COL_ENROLL_DESC = 12
+
+
+# ============================================================
 # GOOGLE AUTHENTICATION
 # ============================================================
 
@@ -68,20 +94,14 @@ GOOGLE_SCOPES = [
 
 def get_google_credentials():
 
-    # --------------------------------------------------------
-    # RENDER
-    #
-    # Render stores the service-account JSON in:
-    #
-    # GOOGLE_SERVICE_ACCOUNT_JSON
-    #
-    # Nothing sensitive is stored in GitHub.
-    # --------------------------------------------------------
-
     raw_json = os.getenv(
         "GOOGLE_SERVICE_ACCOUNT_JSON",
         "",
     ).strip()
+
+    # --------------------------------------------------------
+    # RENDER
+    # --------------------------------------------------------
 
     if raw_json:
 
@@ -230,8 +250,7 @@ def google_retry(
                 f"{description} failed "
                 f"with temporary Google error. "
                 f"Attempt {attempt}/{attempts}. "
-                f"Retrying in "
-                f"{delay:.1f}s..."
+                f"Retrying in {delay:.1f}s..."
             )
 
             time.sleep(
@@ -242,7 +261,7 @@ def google_retry(
 
 
 # ============================================================
-# GOOGLE SHEETS
+# GOOGLE SHEET
 # ============================================================
 
 def get_sheet(
@@ -288,7 +307,7 @@ def get_sheet(
 
 
 # ============================================================
-# DATE / PREVIOUS RUN
+# DATE PARSING
 # ============================================================
 
 def parse_sheet_date(
@@ -309,6 +328,10 @@ def parse_sheet_date(
         return None
 
 
+# ============================================================
+# FIND PREVIOUS DATED ENROLLMENT RUN
+# ============================================================
+
 def get_previous_run_sheet(
     spreadsheet,
     current_sheet_name,
@@ -324,8 +347,7 @@ def get_previous_run_sheet(
 
         print(
             "Could not parse current "
-            f"sheet name: "
-            f"{current_sheet_name}"
+            f"sheet name: {current_sheet_name}"
         )
 
         return None
@@ -340,8 +362,11 @@ def get_previous_run_sheet(
 
     for worksheet in worksheets:
 
-        name = worksheet.title
+        name = (
+            worksheet.title
+        )
 
+        # Ignore system sheets.
         if name in [
             "Enrollment Home",
             "Enrollment Template",
@@ -349,6 +374,7 @@ def get_previous_run_sheet(
         ]:
             continue
 
+        # Ignore today's sheet.
         if (
             name ==
             current_sheet_name
@@ -402,7 +428,18 @@ def get_previous_run_sheet(
 
 
 # ============================================================
-# PREVIOUS LOOKUP
+# PREVIOUS DAY LOOKUP
+#
+# IMPORTANT:
+#
+# Today's G Previous Amount
+#     = previous day's J Current
+#
+# Today's L Previous enrollment capacity
+#     = previous day's H Enroll Cap
+#
+# We intentionally DO NOT carry forward yesterday's
+# G or L historical fields.
 # ============================================================
 
 def build_previous_lookup(
@@ -410,6 +447,12 @@ def build_previous_lookup(
 ):
 
     if previous_sheet is None:
+
+        print(
+            "No previous enrollment run. "
+            "Previous values will remain blank."
+        )
+
         return {}
 
     values = google_retry(
@@ -423,59 +466,111 @@ def build_previous_lookup(
 
     for row in values[1:]:
 
-        if len(row) < 3:
+        if (
+            len(row) <=
+            COL_CLASS_NUM
+        ):
             continue
 
         class_num = str(
-            row[2]
+            row[
+                COL_CLASS_NUM
+            ]
         ).strip()
 
         if not class_num:
             continue
 
-        lookup[class_num] = {
+        # ----------------------------------------------------
+        # PREVIOUS DAY ACTUAL VALUES
+        # ----------------------------------------------------
+
+        previous_current = (
+            row[
+                COL_CURRENT
+            ]
+            if len(row) >
+            COL_CURRENT
+            else ""
+        )
+
+        previous_cap = (
+            row[
+                COL_ENROLL_CAP
+            ]
+            if len(row) >
+            COL_ENROLL_CAP
+            else ""
+        )
+
+        previous_open = (
+            row[
+                COL_OPEN_SEATS
+            ]
+            if len(row) >
+            COL_OPEN_SEATS
+            else ""
+        )
+
+        previous_last_name = (
+            row[
+                COL_INSTRUCTOR_LAST
+            ]
+            if len(row) >
+            COL_INSTRUCTOR_LAST
+            else ""
+        )
+
+        previous_first_name = (
+            row[
+                COL_INSTRUCTOR_FIRST
+            ]
+            if len(row) >
+            COL_INSTRUCTOR_FIRST
+            else ""
+        )
+
+        lookup[
+            class_num
+        ] = {
 
             "last_name":
-                row[4]
-                if len(row) > 4
-                else "",
+                previous_last_name,
 
             "first_name":
-                row[5]
-                if len(row) > 5
-                else "",
+                previous_first_name,
 
+            # Previous day's actual enrollment.
             "previous_amount":
-                row[6]
-                if len(row) > 6
-                else "",
+                previous_current,
 
+            # Previous day's actual capacity.
+            "previous_capacity":
+                previous_cap,
+
+            # Retain actual previous values for
+            # changed/unchanged comparisons.
             "cap":
-                row[7]
-                if len(row) > 7
-                else "",
+                previous_cap,
 
             "open":
-                row[8]
-                if len(row) > 8
-                else "",
+                previous_open,
 
             "current":
-                row[9]
-                if len(row) > 9
-                else "",
+                previous_current,
         }
 
     print(
         f"Loaded {len(lookup)} classes "
-        "from previous run."
+        f"from previous run "
+        f"{previous_sheet.title}."
     )
 
     return lookup
 
 
 # ============================================================
-# CURRENT DAILY SHEET LOOKUP
+# CURRENT DAILY ROW LOOKUP
 # ============================================================
 
 def build_daily_row_lookup(
@@ -489,20 +584,30 @@ def build_daily_row_lookup(
         start=2,
     ):
 
-        if len(row) <= 2:
+        if (
+            len(row) <=
+            COL_CLASS_NUM
+        ):
             continue
 
         class_num = str(
-            row[2]
+            row[
+                COL_CLASS_NUM
+            ]
         ).strip()
 
         if not class_num:
             continue
 
-        # Keep the first occurrence.
-        if class_num not in lookup:
+        # Keep first occurrence.
+        if (
+            class_num not in
+            lookup
+        ):
 
-            lookup[class_num] = {
+            lookup[
+                class_num
+            ] = {
                 "row_number":
                     row_number,
 
@@ -514,7 +619,7 @@ def build_daily_row_lookup(
 
 
 # ============================================================
-# SCRAPER RESULT HELPERS
+# RESULT HELPERS
 # ============================================================
 
 def scraper_error(
@@ -525,7 +630,9 @@ def scraper_error(
 
     return {
         "class_num":
-            str(class_num),
+            str(
+                class_num
+            ),
 
         "status":
             "ERROR",
@@ -534,7 +641,9 @@ def scraper_error(
             error_type,
 
         "error":
-            str(error),
+            str(
+                error
+            ),
     }
 
 
@@ -546,7 +655,9 @@ def scraper_no_data(
 
     return {
         "class_num":
-            str(class_num),
+            str(
+                class_num
+            ),
 
         "status":
             "NO_DATA",
@@ -555,7 +666,9 @@ def scraper_no_data(
             error_type,
 
         "error":
-            str(error),
+            str(
+                error
+            ),
     }
 
 
@@ -593,7 +706,9 @@ async def scrape_class_once(
     term,
 ):
 
-    page = await context.new_page()
+    page = (
+        await context.new_page()
+    )
 
     class_num = str(
         class_num
@@ -618,15 +733,17 @@ async def scrape_class_once(
     try:
 
         # ----------------------------------------------------
-        # PAGE LOAD
+        # LOAD ASU PAGE
         # ----------------------------------------------------
 
         try:
 
-            response = await page.goto(
-                url,
-                timeout=30000,
-                wait_until="load",
+            response = (
+                await page.goto(
+                    url,
+                    timeout=30000,
+                    wait_until="load",
+                )
             )
 
         except PlaywrightTimeoutError:
@@ -642,7 +759,7 @@ async def scrape_class_once(
             )
 
         # ----------------------------------------------------
-        # HTTP STATUS
+        # HTTP RESPONSE
         # ----------------------------------------------------
 
         if response:
@@ -651,7 +768,10 @@ async def scrape_class_once(
                 response.status
             )
 
-            if status_code == 429:
+            if (
+                status_code ==
+                429
+            ):
 
                 return scraper_error(
                     class_num,
@@ -694,9 +814,11 @@ async def scrape_class_once(
             try:
 
                 body_text = (
-                    await page.locator(
+                    await page
+                    .locator(
                         "body"
-                    ).inner_text()
+                    )
+                    .inner_text()
                 )
 
                 body_text = re.sub(
@@ -756,13 +878,15 @@ async def scrape_class_once(
             )
 
         # ----------------------------------------------------
-        # BODY
+        # PAGE TEXT
         # ----------------------------------------------------
 
         text_content = (
-            await page.locator(
+            await page
+            .locator(
                 "body"
-            ).inner_text()
+            )
+            .inner_text()
         )
 
         text_content = re.sub(
@@ -816,8 +940,13 @@ async def scrape_class_once(
         )
 
         current = (
-            int(enroll_cap) -
-            int(open_seats)
+            int(
+                enroll_cap
+            )
+            -
+            int(
+                open_seats
+            )
         )
 
         print(
@@ -839,13 +968,19 @@ async def scrape_class_once(
                 instructor,
 
             "cap":
-                str(enroll_cap),
+                str(
+                    enroll_cap
+                ),
 
             "open":
-                str(open_seats),
+                str(
+                    open_seats
+                ),
 
             "current":
-                str(current),
+                str(
+                    current
+                ),
 
             "error_type":
                 None,
@@ -864,7 +999,9 @@ async def scrape_class_once(
         return scraper_error(
             class_num,
             "TIMEOUT",
-            str(e),
+            str(
+                e
+            ),
         )
 
     except Exception as e:
@@ -878,7 +1015,9 @@ async def scrape_class_once(
         return scraper_error(
             class_num,
             type(e).__name__,
-            str(e),
+            str(
+                e
+            ),
         )
 
     finally:
@@ -893,7 +1032,7 @@ async def scrape_class_once(
 
 
 # ============================================================
-# SCRAPE CLASS WITH RETRIES
+# SCRAPE WITH RETRIES
 # ============================================================
 
 async def scrape_class(
@@ -910,34 +1049,48 @@ async def scrape_class(
         max_attempts + 1,
     ):
 
-        result = await scrape_class_once(
-            context,
-            class_num,
-            term,
+        result = (
+            await scrape_class_once(
+                context,
+                class_num,
+                term,
+            )
         )
 
-        last_result = result
+        last_result = (
+            result
+        )
 
-        # Success or confirmed no-data does not retry.
+        # Success and confirmed no-data do not retry.
         if (
-            result.get("status")
+            result.get(
+                "status"
+            )
             in [
                 "SUCCESS",
                 "NO_DATA",
             ]
         ):
+
             return result
 
         if not is_transient_result(
             result
         ):
+
             return result
 
-        if attempt >= max_attempts:
+        if (
+            attempt >=
+            max_attempts
+        ):
+
             break
 
         delay = min(
-            2 ** (attempt - 1),
+            2 ** (
+                attempt - 1
+            ),
             8,
         )
 
@@ -971,15 +1124,19 @@ def split_instructor(
 ):
 
     if not instructor:
+
         return "", ""
 
     if instructor.lower() in [
         "tba",
         "staff",
     ]:
+
         return "", ""
 
-    parts = instructor.split()
+    parts = (
+        instructor.split()
+    )
 
     if len(parts) >= 2:
 
@@ -996,11 +1153,104 @@ def split_instructor(
             first_name,
         )
 
-    return "", instructor
+    return (
+        "",
+        instructor,
+    )
 
 
 # ============================================================
-# PROCESS + UPDATE ONE BATCH
+# DIFFERENCE
+# ============================================================
+
+def calculate_difference(
+    current_value,
+    previous_value,
+):
+
+    current_text = str(
+        current_value
+        if current_value is not None
+        else ""
+    ).strip()
+
+    previous_text = str(
+        previous_value
+        if previous_value is not None
+        else ""
+    ).strip()
+
+    # No historical observation.
+    if (
+        current_text == "" or
+        previous_text == ""
+    ):
+
+        return ""
+
+    try:
+
+        return (
+            int(
+                current_text
+            )
+            -
+            int(
+                previous_text
+            )
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return ""
+
+
+# ============================================================
+# ENROLLMENT DESCRIPTION
+# ============================================================
+
+def build_enrollment_description(
+    update,
+):
+
+    if update == "":
+
+        return ""
+
+    try:
+
+        amount = int(
+            update
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return ""
+
+    if amount > 0:
+
+        return (
+            f"Increased by {amount}"
+        )
+
+    if amount < 0:
+
+        return (
+            f"Decreased by "
+            f"{abs(amount)}"
+        )
+
+    return "No change"
+
+
+# ============================================================
+# PROCESS + WRITE ONE BATCH
 # ============================================================
 
 def update_batch(
@@ -1014,16 +1264,21 @@ def update_batch(
 
     changed_count = 0
     unchanged_count = 0
+
     error_count = 0
     no_data_count = 0
 
     error_classes = []
     no_data_classes = []
 
-    for result in batch_results:
+    for result in (
+        batch_results
+    ):
 
         class_num = str(
-            result["class_num"]
+            result[
+                "class_num"
+            ]
         ).strip()
 
         daily = (
@@ -1031,6 +1286,10 @@ def update_batch(
                 class_num
             )
         )
+
+        # ----------------------------------------------------
+        # CLASS MISSING FROM DAILY SHEET
+        # ----------------------------------------------------
 
         if not daily:
 
@@ -1058,11 +1317,15 @@ def update_batch(
             continue
 
         row_number = (
-            daily["row_number"]
+            daily[
+                "row_number"
+            ]
         )
 
         row_data = (
-            daily["row"]
+            daily[
+                "row"
+            ]
         )
 
         previous = (
@@ -1073,10 +1336,15 @@ def update_batch(
         )
 
         # ----------------------------------------------------
-        # ERROR
+        # SCRAPER ERROR
         # ----------------------------------------------------
 
-        if result["status"] == "ERROR":
+        if (
+            result[
+                "status"
+            ] ==
+            "ERROR"
+        ):
 
             error_count += 1
 
@@ -1104,7 +1372,7 @@ def update_batch(
             print(
                 f"{class_num}: ERROR - "
                 f"{info['error_type']} - "
-                "keeping previous values."
+                "keeping existing values."
             )
 
             continue
@@ -1113,7 +1381,12 @@ def update_batch(
         # NO DATA
         # ----------------------------------------------------
 
-        if result["status"] == "NO_DATA":
+        if (
+            result[
+                "status"
+            ] ==
+            "NO_DATA"
+        ):
 
             no_data_count += 1
 
@@ -1141,14 +1414,14 @@ def update_batch(
             print(
                 f"{class_num}: NO DATA - "
                 f"{info['error_type']} - "
-                "keeping previous values."
+                "keeping existing values."
             )
 
             continue
 
-        # ----------------------------------------------------
+        # ====================================================
         # SUCCESS
-        # ----------------------------------------------------
+        # ====================================================
 
         last_name, first_name = (
             split_instructor(
@@ -1159,173 +1432,296 @@ def update_batch(
             )
         )
 
-        today_values = {
+        # ----------------------------------------------------
+        # TODAY'S ASU VALUES
+        # ----------------------------------------------------
 
-            "last_name":
-                (
-                    last_name
-                    if last_name
-                    else previous.get(
-                        "last_name",
-                        row_data[4]
-                        if len(row_data) > 4
-                        else "",
-                    )
-                ),
+        today_cap = str(
+            result.get(
+                "cap",
+                "",
+            )
+        ).strip()
 
-            "first_name":
-                (
-                    first_name
-                    if first_name
-                    else previous.get(
-                        "first_name",
-                        row_data[5]
-                        if len(row_data) > 5
-                        else "",
-                    )
-                ),
+        today_open = str(
+            result.get(
+                "open",
+                "",
+            )
+        ).strip()
 
-            "cap":
-                str(
-                    result["cap"]
-                ),
+        today_current = str(
+            result.get(
+                "current",
+                "",
+            )
+        ).strip()
 
-            "open":
-                str(
-                    result["open"]
-                ),
+        # ----------------------------------------------------
+        # HISTORICAL VALUES
+        #
+        # TODAY G
+        # Previous Amount
+        # = PREVIOUS DAY J Current
+        #
+        # TODAY L
+        # Previous enrollment capacity
+        # = PREVIOUS DAY H Enroll Cap
+        # ----------------------------------------------------
 
-            "current":
-                str(
-                    result["current"]
-                ),
-        }
+        previous_amount = str(
+            previous.get(
+                "previous_amount",
+                "",
+            )
+        ).strip()
 
-        previous_values = {
+        previous_capacity = str(
+            previous.get(
+                "previous_capacity",
+                "",
+            )
+        ).strip()
 
-            "last_name":
+        # ----------------------------------------------------
+        # INSTRUCTOR FALLBACK
+        # ----------------------------------------------------
+
+        if not last_name:
+
+            last_name = str(
                 previous.get(
                     "last_name",
-                    row_data[4]
-                    if len(row_data) > 4
-                    else "",
-                ),
+                    (
+                        row_data[
+                            COL_INSTRUCTOR_LAST
+                        ]
+                        if len(row_data) >
+                        COL_INSTRUCTOR_LAST
+                        else ""
+                    ),
+                )
+            ).strip()
 
-            "first_name":
+        if not first_name:
+
+            first_name = str(
                 previous.get(
                     "first_name",
-                    row_data[5]
-                    if len(row_data) > 5
-                    else "",
-                ),
+                    (
+                        row_data[
+                            COL_INSTRUCTOR_FIRST
+                        ]
+                        if len(row_data) >
+                        COL_INSTRUCTOR_FIRST
+                        else ""
+                    ),
+                )
+            ).strip()
 
-            "cap":
-                previous.get(
-                    "cap",
-                    row_data[7]
-                    if len(row_data) > 7
-                    else "",
-                ),
+        # ----------------------------------------------------
+        # UPDATE
+        #
+        # K =
+        # TODAY Current
+        # -
+        # PREVIOUS DAY Current
+        # ----------------------------------------------------
 
-            "open":
-                previous.get(
-                    "open",
-                    row_data[8]
-                    if len(row_data) > 8
-                    else "",
-                ),
-
-            "current":
-                previous.get(
-                    "current",
-                    row_data[9]
-                    if len(row_data) > 9
-                    else "",
-                ),
-        }
-
-        changed = (
-            today_values !=
-            previous_values
+        enrollment_update = (
+            calculate_difference(
+                today_current,
+                previous_amount,
+            )
         )
+
+        # ----------------------------------------------------
+        # ENROLL DESC
+        # ----------------------------------------------------
+
+        enrollment_description = (
+            build_enrollment_description(
+                enrollment_update
+            )
+        )
+
+        # ----------------------------------------------------
+        # CHANGED / UNCHANGED
+        # ----------------------------------------------------
+
+        has_previous = bool(
+            previous
+        )
+
+        previous_cap = str(
+            previous.get(
+                "cap",
+                "",
+            )
+        ).strip()
+
+        previous_open = str(
+            previous.get(
+                "open",
+                "",
+            )
+        ).strip()
+
+        previous_current = str(
+            previous.get(
+                "current",
+                "",
+            )
+        ).strip()
+
+        previous_last = str(
+            previous.get(
+                "last_name",
+                "",
+            )
+        ).strip()
+
+        previous_first = str(
+            previous.get(
+                "first_name",
+                "",
+            )
+        ).strip()
+
+        changed = False
+
+        if has_previous:
+
+            changed = (
+                today_cap !=
+                previous_cap
+                or
+                today_open !=
+                previous_open
+                or
+                today_current !=
+                previous_current
+                or
+                last_name !=
+                previous_last
+                or
+                first_name !=
+                previous_first
+            )
 
         if changed:
 
             changed_count += 1
 
             print(
-                f"{class_num}: CHANGED"
+                f"{class_num}: CHANGED "
+                f"| Enrollment "
+                f"{previous_amount} -> "
+                f"{today_current} "
+                f"| Capacity "
+                f"{previous_capacity} -> "
+                f"{today_cap}"
             )
 
         else:
 
             unchanged_count += 1
 
-            print(
-                f"{class_num}: UNCHANGED"
-            )
+            if has_previous:
 
-        previous_amount = (
-            previous.get(
-                "previous_amount",
-                row_data[6]
-                if len(row_data) > 6
-                else "",
-            )
-        )
+                print(
+                    f"{class_num}: "
+                    "UNCHANGED"
+                )
+
+            else:
+
+                print(
+                    f"{class_num}: "
+                    "FIRST OBSERVATION"
+                )
+
+        # ====================================================
+        # WRITE E:M
+        #
+        # E Instructor Last Name
+        # F Instructor First Name
+        # G Previous Amount
+        # H Enroll Cap
+        # I Open Seats
+        # J Current
+        # K Update
+        # L Previous enrollment capacity
+        # M Enroll Desc
+        # ====================================================
 
         new_row_values = [
-            today_values[
-                "last_name"
-            ],
 
-            today_values[
-                "first_name"
-            ],
+            # E
+            last_name,
 
+            # F
+            first_name,
+
+            # G
             previous_amount,
 
-            today_values[
-                "cap"
-            ],
+            # H
+            today_cap,
 
-            today_values[
-                "open"
-            ],
+            # I
+            today_open,
 
-            today_values[
-                "current"
-            ],
+            # J
+            today_current,
+
+            # K
+            enrollment_update,
+
+            # L
+            previous_capacity,
+
+            # M
+            enrollment_description,
         ]
 
         updates.append({
             "range":
                 f"E{row_number}:"
-                f"J{row_number}",
+                f"M{row_number}",
 
             "values": [
                 new_row_values
             ],
         })
 
-        # Keep in-memory row synchronized.
-        while len(row_data) < 10:
-            row_data.append("")
+        # Keep local copy synchronized.
+        while (
+            len(row_data) <=
+            COL_ENROLL_DESC
+        ):
 
-        row_data[4:10] = (
+            row_data.append(
+                ""
+            )
+
+        row_data[
+            COL_INSTRUCTOR_LAST:
+            COL_ENROLL_DESC + 1
+        ] = (
             new_row_values
         )
 
-    # --------------------------------------------------------
-    # COMMIT BATCH
-    # --------------------------------------------------------
+    # ========================================================
+    # BATCH WRITE
+    # ========================================================
 
     if updates:
 
         print(
-            f"Writing {len(updates)} "
-            "successful rows from "
-            "current batch..."
+            f"Writing "
+            f"{len(updates)} "
+            "successful rows..."
         )
 
         google_retry(
@@ -1362,7 +1758,7 @@ def update_batch(
 
 
 # ============================================================
-# PROCESS ONE SCRAPER BATCH
+# PROCESS SCRAPER BATCH
 # ============================================================
 
 async def process_scrape_batch(
@@ -1397,7 +1793,7 @@ async def main(
 ):
 
     # --------------------------------------------------------
-    # NORMALIZE CONCURRENCY
+    # CONCURRENCY
     # --------------------------------------------------------
 
     try:
@@ -1429,7 +1825,7 @@ async def main(
     )
 
     # --------------------------------------------------------
-    # SHEET
+    # CURRENT SHEET
     # --------------------------------------------------------
 
     sheet = get_sheet(
@@ -1459,7 +1855,7 @@ async def main(
     )
 
     # --------------------------------------------------------
-    # CURRENT DATA
+    # CURRENT DAILY DATA
     # --------------------------------------------------------
 
     all_values = google_retry(
@@ -1474,17 +1870,31 @@ async def main(
         )
     )
 
-    raw_class_nums = [
-        str(row[2]).strip()
-        for row in all_values[1:]
+    raw_class_nums = []
+
+    for row in (
+        all_values[1:]
+    ):
+
         if (
-            len(row) > 2 and
-            row[2]
-        )
-    ]
+            len(row) >
+            COL_CLASS_NUM
+            and
+            row[
+                COL_CLASS_NUM
+            ]
+        ):
+
+            raw_class_nums.append(
+                str(
+                    row[
+                        COL_CLASS_NUM
+                    ]
+                ).strip()
+            )
 
     # --------------------------------------------------------
-    # DEDUPLICATE
+    # DEDUPLICATE CLASS NUMBERS
     # --------------------------------------------------------
 
     seen = set()
@@ -1513,14 +1923,24 @@ async def main(
         )
 
     duplicate_count = (
-        len(raw_class_nums) -
-        len(class_nums)
+        len(
+            raw_class_nums
+        )
+        -
+        len(
+            class_nums
+        )
     )
 
     print(
-        f"Found {len(class_nums)} "
+        f"Found "
+        f"{len(class_nums)} "
         "unique classes."
     )
+
+    # --------------------------------------------------------
+    # START CALLBACK
+    # --------------------------------------------------------
 
     if progress_callback:
 
@@ -1536,7 +1956,9 @@ async def main(
                 ),
 
             "total":
-                len(class_nums),
+                len(
+                    class_nums
+                ),
 
             "processed":
                 0,
@@ -1558,18 +1980,25 @@ async def main(
     all_results = []
 
     total_changed = 0
+
     total_unchanged = 0
+
     total_errors = 0
+
     total_no_data = 0
 
     all_error_classes = []
+
     all_no_data_classes = []
 
-    # --------------------------------------------------------
+    # ========================================================
     # PLAYWRIGHT
-    # --------------------------------------------------------
+    # ========================================================
 
-    async with async_playwright() as p:
+    async with (
+        async_playwright()
+        as p
+    ):
 
         browser = (
             await p.chromium.launch(
@@ -1583,7 +2012,8 @@ async def main(
         )
 
         context = (
-            await browser.new_context()
+            await browser
+            .new_context()
         )
 
         iterator = iter(
@@ -1633,6 +2063,7 @@ async def main(
                 )
 
                 if not batch:
+
                     break
 
                 print(
@@ -1668,7 +2099,8 @@ async def main(
                 # --------------------------------------------
 
                 batch_results = (
-                    await process_scrape_batch(
+                    await
+                    process_scrape_batch(
                         context,
                         batch,
                         term,
@@ -1730,10 +2162,10 @@ async def main(
 
                 successful_so_far = sum(
                     1
-                    for result
+                    for item
                     in all_results
                     if (
-                        result[
+                        item[
                             "status"
                         ] ==
                         "SUCCESS"
@@ -1741,7 +2173,7 @@ async def main(
                 )
 
                 # --------------------------------------------
-                # PROGRESS
+                # PROGRESS CALLBACK
                 # --------------------------------------------
 
                 if progress_callback:
@@ -1792,21 +2224,28 @@ async def main(
                     })
 
                 # --------------------------------------------
-                # SMALL DELAY BETWEEN BATCHES
+                # DELAY BETWEEN BATCHES
                 # --------------------------------------------
 
                 if (
-                    len(all_results) <
-                    len(class_nums)
+                    len(
+                        all_results
+                    )
+                    <
+                    len(
+                        class_nums
+                    )
                 ):
 
-                    delay = random.uniform(
-                        BATCH_DELAY_MIN,
-                        BATCH_DELAY_MAX,
+                    delay = (
+                        random.uniform(
+                            BATCH_DELAY_MIN,
+                            BATCH_DELAY_MAX,
+                        )
                     )
 
                     print(
-                        "Waiting "
+                        f"Waiting "
                         f"{delay:.1f}s "
                         "before next batch."
                     )
@@ -1819,16 +2258,18 @@ async def main(
 
             await browser.close()
 
-    # --------------------------------------------------------
+    # ========================================================
     # FINAL COUNTS
-    # --------------------------------------------------------
+    # ========================================================
 
     successful = sum(
         1
-        for result
+        for item
         in all_results
         if (
-            result["status"] ==
+            item[
+                "status"
+            ] ==
             "SUCCESS"
         )
     )
@@ -1843,6 +2284,15 @@ async def main(
 
     print(
         "ENROLLMENT RUN COMPLETE"
+    )
+
+    print(
+        "Previous run:",
+        (
+            previous_sheet.title
+            if previous_sheet
+            else "None"
+        ),
     )
 
     print(
@@ -1924,7 +2374,7 @@ async def main(
         })
 
     # --------------------------------------------------------
-    # RESPONSE
+    # RETURN
     # --------------------------------------------------------
 
     return {
