@@ -1890,6 +1890,7 @@ def diagnose_asu():
     return asyncio.run(
         diagnose_asu_api(
             subject="PHY",
+            catalog_num="111",
             term="2267",
         )
     )

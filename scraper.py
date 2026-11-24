@@ -2444,12 +2444,18 @@ def run_enrollment(
         )
     )
 
+
 async def diagnose_asu_api(
     subject="PHY",
+    catalog_num="111",
     term="2267",
 ):
 
     async with async_playwright() as p:
+
+        # ====================================================
+        # START BROWSER
+        # ====================================================
 
         browser = await p.chromium.launch(
             headless=True,
@@ -2464,24 +2470,10 @@ async def diagnose_asu_api(
 
         page = await context.new_page()
 
-        # ====================================================
-        # CAPTURED DATA
-        # ====================================================
-
         captured_requests = []
 
-        bulk_response = {
-            "found": False,
-            "status": None,
-            "url": None,
-            "total": None,
-            "returned": 0,
-            "scroll_id": None,
-            "classes": [],
-        }
-
         # ====================================================
-        # REQUEST HANDLER
+        # CAPTURE ASU API REQUESTS
         # ====================================================
 
         async def handle_request(
@@ -2517,11 +2509,9 @@ async def diagnose_asu_api(
 
         # ====================================================
         # STEP 1
+        # BOOTSTRAP ASU CLASS SEARCH
         #
-        # Bootstrap the normal ASU application.
-        #
-        # This allows ASU's own frontend to establish whatever
-        # session/authentication state the catalog API needs.
+        # Use the exact course we want to test.
         # ====================================================
 
         bootstrap_url = (
@@ -2530,6 +2520,7 @@ async def diagnose_asu_api(
             "advanced=true"
             "&campusOrOnlineSelection=A"
             f"&subject={subject}"
+            f"&catalogNbr={catalog_num}"
             "&honors=F"
             "&promod=F"
             "&searchType=all"
@@ -2541,15 +2532,28 @@ async def diagnose_asu_api(
         )
 
         print(
-            "BOOTSTRAPPING ASU CLASS SEARCH"
+            "ASU COURSE API DIAGNOSTIC"
+        )
+
+        print(
+            f"Course: "
+            f"{subject} {catalog_num}"
+        )
+
+        print(
+            f"Term: {term}"
+        )
+
+        print(
+            "========================================"
+        )
+
+        print(
+            "\nBootstrap URL:"
         )
 
         print(
             bootstrap_url
-        )
-
-        print(
-            "========================================\n"
         )
 
         try:
@@ -2564,44 +2568,18 @@ async def diagnose_asu_api(
 
             print(
                 "Bootstrap navigation timed out. "
-                "Continuing because API/session "
+                "Continuing because ASU session "
                 "state may still be available."
             )
 
-        # Give the SPA time to initialize authentication.
+        # Give ASU SPA time to initialize.
         await page.wait_for_timeout(
-            8000
+            5000
         )
 
         # ====================================================
         # STEP 2
-        #
-        # Inspect browser storage so we know whether the
-        # authenticated API request can be made from the
-        # browser's request context.
-        # ====================================================
-
-        storage_state = (
-            await context.storage_state()
-        )
-
-        print(
-            "Cookies established:",
-            len(
-                storage_state.get(
-                    "cookies",
-                    [],
-                )
-            ),
-        )
-
-        # ====================================================
-        # STEP 3
-        #
-        # Make a subject-wide request through the SAME
-        # authenticated browser context.
-        #
-        # This avoids rendering hundreds of class pages.
+        # COURSE-LEVEL API REQUEST
         # ====================================================
 
         api_url = (
@@ -2612,6 +2590,7 @@ async def diagnose_asu_api(
             "&advanced=true"
             "&campusOrOnlineSelection=A"
             f"&subject={subject}"
+            f"&catalogNbr={catalog_num}"
             "&honors=F"
             "&promod=F"
             "&searchType=all"
@@ -2619,30 +2598,17 @@ async def diagnose_asu_api(
         )
 
         print(
-            "\n========================================"
-        )
-
-        print(
-            "BULK API REQUEST"
+            "\nCourse API URL:"
         )
 
         print(
             api_url
         )
 
-        print(
-            "========================================\n"
-        )
-
-        # ----------------------------------------------------
-        # IMPORTANT
-        #
-        # Use page.evaluate(fetch()) rather than Python
-        # requests.
-        #
-        # That keeps us inside the normal browser environment
-        # established by ASU's frontend.
-        # ----------------------------------------------------
+        # ====================================================
+        # STEP 3
+        # CALL API INSIDE ASU BROWSER SESSION
+        # ====================================================
 
         result = await page.evaluate(
             """
@@ -2654,8 +2620,12 @@ async def diagnose_asu_api(
                         await fetch(
                             url,
                             {
-                                method: 'GET',
-                                credentials: 'include',
+                                method:
+                                    'GET',
+
+                                credentials:
+                                    'include',
+
                                 headers: {
                                     'Accept':
                                         'application/json'
@@ -2720,26 +2690,28 @@ async def diagnose_asu_api(
             api_url,
         )
 
-        print(
-            "Bulk API status:",
-            result.get(
-                "status"
-            ),
-        )
-
         # ====================================================
         # STEP 4
-        #
-        # PROCESS RESPONSE
+        # HTTP RESULT
         # ====================================================
+
+        status = (
+            result.get(
+                "status"
+            )
+        )
+
+        print(
+            "\nAPI status:",
+            status,
+        )
 
         if not result.get(
             "ok"
         ):
 
             print(
-                "Bulk API request failed:",
-                result,
+                "Course API request failed."
             )
 
             await browser.close()
@@ -2751,20 +2723,21 @@ async def diagnose_asu_api(
                 "subject":
                     subject,
 
+                "catalog_num":
+                    catalog_num,
+
                 "term":
                     term,
 
-                "bulk_status":
-                    result.get(
-                        "status"
-                    ),
+                "status":
+                    status,
 
-                "bulk_error":
+                "error":
                     result.get(
                         "error"
                     ),
 
-                "bulk_data":
+                "response":
                     result.get(
                         "data"
                     ),
@@ -2773,10 +2746,16 @@ async def diagnose_asu_api(
                     captured_requests,
             }
 
+        # ====================================================
+        # STEP 5
+        # RESPONSE
+        # ====================================================
+
         data = (
             result.get(
                 "data"
-            ) or {}
+            )
+            or {}
         )
 
         classes = (
@@ -2791,13 +2770,6 @@ async def diagnose_asu_api(
                 "total"
             )
         )
-
-        # ASU returns:
-        #
-        # "total": {
-        #     "value": 123,
-        #     "relation": "eq"
-        # }
 
         if isinstance(
             total_data,
@@ -2823,15 +2795,15 @@ async def diagnose_asu_api(
         )
 
         print(
-            "Returned classes:",
-            len(
-                classes
-            ),
+            "Reported total:",
+            total,
         )
 
         print(
-            "Reported total:",
-            total,
+            "Returned:",
+            len(
+                classes
+            ),
         )
 
         print(
@@ -2842,11 +2814,8 @@ async def diagnose_asu_api(
         )
 
         # ====================================================
-        # STEP 5
-        #
-        # Extract only fields useful to our automation.
-        #
-        # Do NOT return the enormous full ASU response.
+        # STEP 6
+        # SIMPLIFY EACH SECTION
         # ====================================================
 
         simplified = []
@@ -2857,6 +2826,7 @@ async def diagnose_asu_api(
                 item,
                 dict,
             ):
+
                 continue
 
             clas = (
@@ -2870,10 +2840,11 @@ async def diagnose_asu_api(
                 clas,
                 dict,
             ):
+
                 continue
 
             # ------------------------------------------------
-            # SEAT DATA
+            # SEAT INFORMATION
             # ------------------------------------------------
 
             seat_info = (
@@ -2902,7 +2873,7 @@ async def diagnose_asu_api(
                 )
             )
 
-            # Fallback to CLAS fields.
+            # Fall back to CLAS fields.
             if enroll_cap is None:
 
                 enroll_cap = (
@@ -2998,12 +2969,21 @@ async def diagnose_asu_api(
                     "~"
                 )[0]
 
+            # ------------------------------------------------
+            # CLASS
+            # ------------------------------------------------
+
+            class_num = str(
+                clas.get(
+                    "CLASSNBR",
+                    ""
+                )
+            ).strip()
+
             simplified.append({
 
                 "class_num":
-                    clas.get(
-                        "CLASSNBR"
-                    ),
+                    class_num,
 
                 "subject":
                     clas.get(
@@ -3035,11 +3015,11 @@ async def diagnose_asu_api(
                         "TITLE"
                     ),
 
-                "instructor_first":
-                    instructor_first,
-
                 "instructor_last":
                     instructor_last,
+
+                "instructor_first":
+                    instructor_first,
 
                 "enroll_cap":
                     enroll_cap,
@@ -3052,64 +3032,57 @@ async def diagnose_asu_api(
             })
 
         # ====================================================
-        # STEP 6
-        #
-        # SAMPLE OUTPUT
+        # STEP 7
+        # SUMMARY
         # ====================================================
 
         print(
-            "\nFirst five simplified classes:"
+            "\n========================================"
         )
 
-        for item in (
-            simplified[:5]
+        print(
+            f"{subject} {catalog_num} RESULTS"
+        )
+
+        print(
+            "========================================"
+        )
+
+        print(
+            "Sections returned:",
+            len(
+                simplified
+            ),
+        )
+
+        for section in (
+            simplified
         ):
 
             print(
-                item
+                (
+                    f"{section['class_num']} | "
+                    f"Section "
+                    f"{section['section']} | "
+                    f"{section['component']} | "
+                    f"Cap "
+                    f"{section['enroll_cap']} | "
+                    f"Enrolled "
+                    f"{section['enroll_total']} | "
+                    f"Open "
+                    f"{section['open_seats']}"
+                )
             )
 
         # ====================================================
-        # FINISH
+        # CLOSE
         # ====================================================
 
         await browser.close()
 
-        bulk_response[
-            "found"
-        ] = True
-
-        bulk_response[
-            "status"
-        ] = result.get(
-            "status"
-        )
-
-        bulk_response[
-            "url"
-        ] = api_url
-
-        bulk_response[
-            "total"
-        ] = total
-
-        bulk_response[
-            "returned"
-        ] = len(
-            simplified
-        )
-
-        bulk_response[
-            "scroll_id"
-        ] = (
-            scroll_id
-        )
-
-        bulk_response[
-            "classes"
-        ] = (
-            simplified
-        )
+        # ====================================================
+        # RETURN
+        # ====================================================
 
         return {
             "ok":
@@ -3118,11 +3091,48 @@ async def diagnose_asu_api(
             "subject":
                 subject,
 
+            "catalog_num":
+                catalog_num,
+
+            "course":
+                (
+                    f"{subject} "
+                    f"{catalog_num}"
+                ),
+
             "term":
                 term,
 
-            "bulk":
-                bulk_response,
+            "status":
+                status,
+
+            "reported_total":
+                total,
+
+            "returned":
+                len(
+                    simplified
+                ),
+
+            "scroll_required":
+                (
+                    total is not None
+                    and
+                    len(
+                        simplified
+                    ) <
+                    int(
+                        total
+                    )
+                ),
+
+            "scroll_id_present":
+                bool(
+                    scroll_id
+                ),
+
+            "classes":
+                simplified,
 
             "requests":
                 captured_requests,
