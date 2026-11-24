@@ -2443,3 +2443,321 @@ def run_enrollment(
             progress_callback,
         )
     )
+
+async def diagnose_asu_api(
+    class_num,
+    term,
+):
+
+    async with async_playwright() as p:
+
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+
+        context = await browser.new_context()
+
+        page = await context.new_page()
+
+        captured = []
+
+        # ====================================================
+        # REQUEST
+        # ====================================================
+
+        async def handle_request(
+            request,
+        ):
+
+            url = request.url
+
+            if (
+                "catalog-microservices"
+                in url
+            ):
+
+                print(
+                    "\n========== ASU API REQUEST =========="
+                )
+
+                print(
+                    "METHOD:",
+                    request.method,
+                )
+
+                print(
+                    "URL:",
+                    url,
+                )
+
+                headers = (
+                    await request.all_headers()
+                )
+
+                safe_headers = {}
+
+                for key, value in (
+                    headers.items()
+                ):
+
+                    # Do NOT print authentication
+                    # credentials into Render logs.
+                    if key.lower() in [
+                        "authorization",
+                        "cookie",
+                    ]:
+
+                        safe_headers[key] = (
+                            "[REDACTED]"
+                        )
+
+                    else:
+
+                        safe_headers[key] = (
+                            value
+                        )
+
+                print(
+                    "HEADERS:",
+                    safe_headers,
+                )
+
+                captured.append({
+                    "method":
+                        request.method,
+
+                    "url":
+                        url,
+                })
+
+        # ====================================================
+        # RESPONSE
+        # ====================================================
+
+        async def handle_response(
+            response,
+        ):
+
+            url = response.url
+
+            if (
+                "catalog-microservices"
+                not in url
+            ):
+
+                return
+
+            print(
+                "\n========== ASU API RESPONSE =========="
+            )
+
+            print(
+                "STATUS:",
+                response.status,
+            )
+
+            print(
+                "URL:",
+                url,
+            )
+
+            content_type = (
+                await response
+                .all_headers()
+            ).get(
+                "content-type",
+                "",
+            )
+
+            print(
+                "CONTENT TYPE:",
+                content_type,
+            )
+
+            if (
+                "application/json"
+                not in content_type
+            ):
+
+                return
+
+            try:
+
+                data = (
+                    await response.json()
+                )
+
+                # Only print structural information,
+                # not an enormous response.
+
+                if isinstance(
+                    data,
+                    dict,
+                ):
+
+                    print(
+                        "TOP LEVEL KEYS:",
+                        list(
+                            data.keys()
+                        ),
+                    )
+
+                    classes = (
+                        data.get(
+                            "classes"
+                        )
+                    )
+
+                    if (
+                        isinstance(
+                            classes,
+                            list,
+                        )
+                        and
+                        classes
+                    ):
+
+                        print(
+                            "CLASS COUNT:",
+                            len(
+                                classes
+                            ),
+                        )
+
+                        first = (
+                            classes[0]
+                        )
+
+                        print(
+                            "FIRST CLASS KEYS:",
+                            list(
+                                first.keys()
+                            )
+                            if isinstance(
+                                first,
+                                dict,
+                            )
+                            else type(
+                                first
+                            ).__name__,
+                        )
+
+                        if (
+                            isinstance(
+                                first,
+                                dict,
+                            )
+                            and
+                            isinstance(
+                                first.get(
+                                    "CLAS"
+                                ),
+                                dict,
+                            )
+                        ):
+
+                            clas = (
+                                first[
+                                    "CLAS"
+                                ]
+                            )
+
+                            print(
+                                "CLAS KEYS:",
+                                list(
+                                    clas.keys()
+                                ),
+                            )
+
+                            # Only expose the fields
+                            # useful to our scraper.
+
+                            interesting = {}
+
+                            for key in [
+                                "CLASSNBR",
+                                "SUBJECT",
+                                "CATALOGNBR",
+                                "ENRLCAP",
+                                "ENRLTOT",
+                            ]:
+
+                                if key in clas:
+
+                                    interesting[
+                                        key
+                                    ] = (
+                                        clas[
+                                            key
+                                        ]
+                                    )
+
+                            print(
+                                "INTERESTING:",
+                                interesting,
+                            )
+
+            except Exception as e:
+
+                print(
+                    "JSON INSPECTION ERROR:",
+                    type(e).__name__,
+                    str(e),
+                )
+
+        page.on(
+            "request",
+            handle_request,
+        )
+
+        page.on(
+            "response",
+            handle_response,
+        )
+
+        # ====================================================
+        # CLASS SEARCH
+        # ====================================================
+
+        url = (
+            "https://catalog.apps.asu.edu/"
+            "catalog/classes/classlist?"
+            "advanced=true"
+            "&campusOrOnlineSelection=A"
+            f"&classNbr={class_num}"
+            "&honors=F"
+            "&promod=F"
+            "&searchType=all"
+            f"&term={term}"
+        )
+
+        print(
+            "\nOpening:",
+            url,
+        )
+
+        await page.goto(
+            url,
+            timeout=60000,
+            wait_until="domcontentloaded",
+        )
+
+        # Give the SPA time to make API requests.
+        await page.wait_for_timeout(
+            15000
+        )
+
+        print(
+            "\nCaptured "
+            f"{len(captured)} "
+            "catalog API request(s)."
+        )
+
+        await browser.close()
+
+        return captured

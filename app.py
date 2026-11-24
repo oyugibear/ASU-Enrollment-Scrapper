@@ -18,8 +18,12 @@ from fastapi import (
 
 from pydantic import BaseModel
 
-from scraper import run_enrollment
+# from scraper import run_enrollment
 
+from scraper import (
+    run_enrollment,
+    diagnose_asu_api,
+)
 
 # ============================================================
 # APP
@@ -1877,3 +1881,25 @@ def run(
         concurrency=
             req.concurrency,
     )
+
+@app.get(
+    "/diagnose-asu"
+)
+def diagnose_asu():
+
+    import asyncio
+
+    result = asyncio.run(
+        diagnose_asu_api(
+            class_num="65830",
+            term="2267",
+        )
+    )
+
+    return {
+        "ok":
+            True,
+
+        "requests":
+            result,
+    }
