@@ -2453,10 +2453,6 @@ async def diagnose_asu_api(
 
     async with async_playwright() as p:
 
-        # ====================================================
-        # START BROWSER
-        # ====================================================
-
         browser = await p.chromium.launch(
             headless=True,
             args=[
@@ -2470,10 +2466,26 @@ async def diagnose_asu_api(
 
         page = await context.new_page()
 
+        # ====================================================
+        # RESULTS
+        # ====================================================
+
         captured_requests = []
 
+        course_result = {
+            "found": False,
+            "status": None,
+            "url": None,
+            "reported_total": None,
+            "returned": 0,
+            "scroll_id_present": False,
+            "classes": [],
+        }
+
+        response_complete = asyncio.Event()
+
         # ====================================================
-        # CAPTURE ASU API REQUESTS
+        # REQUEST LISTENER
         # ====================================================
 
         async def handle_request(
@@ -2502,28 +2514,478 @@ async def diagnose_asu_api(
                 url,
             )
 
+        # ====================================================
+        # RESPONSE LISTENER
+        #
+        # IMPORTANT:
+        #
+        # We are NOT making our own API request.
+        #
+        # We allow ASU's frontend to make its normal
+        # authenticated request and capture its response.
+        # ====================================================
+
+        async def handle_response(
+            response,
+        ):
+
+            url = response.url
+
+            if (
+                "/search/classes"
+                not in url
+            ):
+                return
+
+            # Only capture the course request we care about.
+            if (
+                f"subject={subject}"
+                not in url
+            ):
+                return
+
+            if (
+                f"catalogNbr={catalog_num}"
+                not in url
+            ):
+                return
+
+            print(
+                "\n========================================"
+            )
+
+            print(
+                "COURSE API RESPONSE CAPTURED"
+            )
+
+            print(
+                "========================================"
+            )
+
+            print(
+                "STATUS:",
+                response.status,
+            )
+
+            print(
+                "URL:",
+                url,
+            )
+
+            # ------------------------------------------------
+            # MUST BE SUCCESSFUL
+            # ------------------------------------------------
+
+            if (
+                response.status != 200
+            ):
+
+                course_result[
+                    "found"
+                ] = True
+
+                course_result[
+                    "status"
+                ] = response.status
+
+                course_result[
+                    "url"
+                ] = url
+
+                response_complete.set()
+
+                return
+
+            # ------------------------------------------------
+            # JSON
+            # ------------------------------------------------
+
+            try:
+
+                data = (
+                    await response.json()
+                )
+
+            except Exception as error:
+
+                print(
+                    "Could not parse response:",
+                    type(error).__name__,
+                    str(error),
+                )
+
+                course_result[
+                    "found"
+                ] = True
+
+                course_result[
+                    "status"
+                ] = response.status
+
+                course_result[
+                    "url"
+                ] = url
+
+                response_complete.set()
+
+                return
+
+            classes = (
+                data.get(
+                    "classes",
+                    []
+                )
+            )
+
+            total_data = (
+                data.get(
+                    "total"
+                )
+            )
+
+            if isinstance(
+                total_data,
+                dict,
+            ):
+
+                total = (
+                    total_data.get(
+                        "value"
+                    )
+                )
+
+            else:
+
+                total = (
+                    total_data
+                )
+
+            scroll_id = (
+                data.get(
+                    "scrollId"
+                )
+            )
+
+            # =================================================
+            # SIMPLIFY CLASSES
+            # =================================================
+
+            simplified = []
+
+            for item in classes:
+
+                if not isinstance(
+                    item,
+                    dict,
+                ):
+                    continue
+
+                clas = (
+                    item.get(
+                        "CLAS",
+                        {}
+                    )
+                )
+
+                if not isinstance(
+                    clas,
+                    dict,
+                ):
+                    continue
+
+                # --------------------------------------------
+                # SEATS
+                # --------------------------------------------
+
+                seat_info = (
+                    item.get(
+                        "seatInfo",
+                        {}
+                    )
+                )
+
+                if not isinstance(
+                    seat_info,
+                    dict,
+                ):
+
+                    seat_info = {}
+
+                enroll_cap = (
+                    seat_info.get(
+                        "ENRL_CAP"
+                    )
+                )
+
+                enroll_total = (
+                    seat_info.get(
+                        "ENRL_TOT"
+                    )
+                )
+
+                # Fallback to CLAS.
+                if enroll_cap is None:
+
+                    enroll_cap = (
+                        clas.get(
+                            "ENRLCAP"
+                        )
+                    )
+
+                if enroll_total is None:
+
+                    enroll_total = (
+                        clas.get(
+                            "ENRLTOT"
+                        )
+                    )
+
+                # --------------------------------------------
+                # OPEN SEATS
+                # --------------------------------------------
+
+                open_seats = None
+
+                try:
+
+                    if (
+                        enroll_cap is not None
+                        and
+                        enroll_total is not None
+                    ):
+
+                        open_seats = (
+                            int(
+                                enroll_cap
+                            )
+                            -
+                            int(
+                                enroll_total
+                            )
+                        )
+
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+
+                    open_seats = None
+
+                # --------------------------------------------
+                # INSTRUCTOR
+                # --------------------------------------------
+
+                first_names = (
+                    clas.get(
+                        "INSTRUCTORSFIRSTNAMESHOWALL"
+                    )
+                    or
+                    clas.get(
+                        "INSTRUCTORSFIRSTNAMELIST"
+                    )
+                    or
+                    []
+                )
+
+                last_names = (
+                    clas.get(
+                        "INSTRUCTORSLASTNAMESHOWALL"
+                    )
+                    or
+                    clas.get(
+                        "INSTRUCTORSLASTNAMELIST"
+                    )
+                    or
+                    []
+                )
+
+                instructor_first = ""
+
+                instructor_last = ""
+
+                if first_names:
+
+                    instructor_first = str(
+                        first_names[0]
+                    ).split(
+                        "~"
+                    )[0]
+
+                if last_names:
+
+                    instructor_last = str(
+                        last_names[0]
+                    ).split(
+                        "~"
+                    )[0]
+
+                # --------------------------------------------
+                # RESULT
+                # --------------------------------------------
+
+                simplified.append({
+
+                    "class_num":
+                        str(
+                            clas.get(
+                                "CLASSNBR",
+                                "",
+                            )
+                        ),
+
+                    "subject":
+                        clas.get(
+                            "SUBJECT"
+                        ),
+
+                    "catalog_num":
+                        clas.get(
+                            "CATALOGNBR"
+                        ),
+
+                    "section":
+                        clas.get(
+                            "CLASSSECTION"
+                        ),
+
+                    "session":
+                        clas.get(
+                            "SESSIONCODE"
+                        ),
+
+                    "component":
+                        clas.get(
+                            "SSRCOMPONENT"
+                        ),
+
+                    "title":
+                        clas.get(
+                            "TITLE"
+                        ),
+
+                    "instructor_last":
+                        instructor_last,
+
+                    "instructor_first":
+                        instructor_first,
+
+                    "enroll_cap":
+                        enroll_cap,
+
+                    "enroll_total":
+                        enroll_total,
+
+                    "open_seats":
+                        open_seats,
+                })
+
+            # =================================================
+            # STORE
+            # =================================================
+
+            course_result[
+                "found"
+            ] = True
+
+            course_result[
+                "status"
+            ] = response.status
+
+            course_result[
+                "url"
+            ] = url
+
+            course_result[
+                "reported_total"
+            ] = total
+
+            course_result[
+                "returned"
+            ] = len(
+                simplified
+            )
+
+            course_result[
+                "scroll_id_present"
+            ] = bool(
+                scroll_id
+            )
+
+            course_result[
+                "classes"
+            ] = simplified
+
+            # =================================================
+            # LOG SUMMARY
+            # =================================================
+
+            print(
+                "Reported total:",
+                total,
+            )
+
+            print(
+                "Returned:",
+                len(
+                    simplified
+                ),
+            )
+
+            print(
+                "Scroll ID:",
+                bool(
+                    scroll_id
+                ),
+            )
+
+            for item in simplified:
+
+                print(
+                    (
+                        f"{item['class_num']} | "
+                        f"{item['component']} | "
+                        f"Cap "
+                        f"{item['enroll_cap']} | "
+                        f"Enrolled "
+                        f"{item['enroll_total']} | "
+                        f"Open "
+                        f"{item['open_seats']}"
+                    )
+                )
+
+            response_complete.set()
+
+        # ====================================================
+        # REGISTER LISTENERS
+        # ====================================================
+
         page.on(
             "request",
             handle_request,
         )
 
+        page.on(
+            "response",
+            handle_response,
+        )
+
         # ====================================================
-        # STEP 1
-        # BOOTSTRAP ASU CLASS SEARCH
+        # NORMAL ASU COURSE SEARCH
         #
-        # Use the exact course we want to test.
+        # ASU's own JavaScript makes the authenticated
+        # /search/classes request.
         # ====================================================
 
-        bootstrap_url = (
+        url = (
             "https://catalog.apps.asu.edu/"
             "catalog/classes/classlist?"
             "advanced=true"
             "&campusOrOnlineSelection=A"
-            f"&subject={subject}"
             f"&catalogNbr={catalog_num}"
             "&honors=F"
             "&promod=F"
             "&searchType=all"
+            f"&subject={subject}"
             f"&term={term}"
         )
 
@@ -2532,16 +2994,11 @@ async def diagnose_asu_api(
         )
 
         print(
-            "ASU COURSE API DIAGNOSTIC"
+            "OPENING ASU COURSE SEARCH"
         )
 
         print(
-            f"Course: "
             f"{subject} {catalog_num}"
-        )
-
-        print(
-            f"Term: {term}"
         )
 
         print(
@@ -2549,17 +3006,13 @@ async def diagnose_asu_api(
         )
 
         print(
-            "\nBootstrap URL:"
-        )
-
-        print(
-            bootstrap_url
+            url
         )
 
         try:
 
             await page.goto(
-                bootstrap_url,
+                url,
                 timeout=60000,
                 wait_until="domcontentloaded",
             )
@@ -2567,516 +3020,32 @@ async def diagnose_asu_api(
         except PlaywrightTimeoutError:
 
             print(
-                "Bootstrap navigation timed out. "
-                "Continuing because ASU session "
-                "state may still be available."
+                "Navigation timed out. "
+                "Waiting for API response anyway."
             )
 
-        # Give ASU SPA time to initialize.
+        # ====================================================
+        # WAIT FOR ASU'S API RESPONSE
+        # ====================================================
+
+        try:
+
+            await asyncio.wait_for(
+                response_complete.wait(),
+                timeout=30,
+            )
+
+        except asyncio.TimeoutError:
+
+            print(
+                "Timed out waiting for "
+                "course API response."
+            )
+
+        # Small buffer for response handler.
         await page.wait_for_timeout(
-            5000
+            500
         )
-
-        # ====================================================
-        # STEP 2
-        # COURSE-LEVEL API REQUEST
-        # ====================================================
-
-        api_url = (
-            "https://eadvs-cscc-catalog-api.apps.asu.edu/"
-            "catalog-microservices/api/v1/"
-            "search/classes"
-            "?refine=Y"
-            "&advanced=true"
-            "&campusOrOnlineSelection=A"
-            f"&subject={subject}"
-            f"&catalogNbr={catalog_num}"
-            "&honors=F"
-            "&promod=F"
-            "&searchType=all"
-            f"&term={term}"
-        )
-
-        print(
-            "\nCourse API URL:"
-        )
-
-        print(
-            api_url
-        )
-
-        # ====================================================
-        # STEP 3
-        # CALL API INSIDE ASU BROWSER SESSION
-        # ====================================================
-
-        result = await page.evaluate(
-            """
-            async (url) => {
-
-                try {
-
-                    const response =
-                        await fetch(
-                            url,
-                            {
-                                method:
-                                    'GET',
-
-                                credentials:
-                                    'include',
-
-                                headers: {
-                                    'Accept':
-                                        'application/json'
-                                }
-                            }
-                        );
-
-                    const text =
-                        await response.text();
-
-                    let data = null;
-
-                    try {
-
-                        data =
-                            JSON.parse(
-                                text
-                            );
-
-                    } catch (error) {
-
-                        data = {
-                            raw:
-                                text.substring(
-                                    0,
-                                    2000
-                                )
-                        };
-
-                    }
-
-                    return {
-                        status:
-                            response.status,
-
-                        ok:
-                            response.ok,
-
-                        data:
-                            data
-                    };
-
-                } catch (error) {
-
-                    return {
-                        status:
-                            0,
-
-                        ok:
-                            false,
-
-                        error:
-                            String(
-                                error
-                            )
-                    };
-
-                }
-
-            }
-            """,
-            api_url,
-        )
-
-        # ====================================================
-        # STEP 4
-        # HTTP RESULT
-        # ====================================================
-
-        status = (
-            result.get(
-                "status"
-            )
-        )
-
-        print(
-            "\nAPI status:",
-            status,
-        )
-
-        if not result.get(
-            "ok"
-        ):
-
-            print(
-                "Course API request failed."
-            )
-
-            await browser.close()
-
-            return {
-                "ok":
-                    False,
-
-                "subject":
-                    subject,
-
-                "catalog_num":
-                    catalog_num,
-
-                "term":
-                    term,
-
-                "status":
-                    status,
-
-                "error":
-                    result.get(
-                        "error"
-                    ),
-
-                "response":
-                    result.get(
-                        "data"
-                    ),
-
-                "requests":
-                    captured_requests,
-            }
-
-        # ====================================================
-        # STEP 5
-        # RESPONSE
-        # ====================================================
-
-        data = (
-            result.get(
-                "data"
-            )
-            or {}
-        )
-
-        classes = (
-            data.get(
-                "classes",
-                []
-            )
-        )
-
-        total_data = (
-            data.get(
-                "total"
-            )
-        )
-
-        if isinstance(
-            total_data,
-            dict,
-        ):
-
-            total = (
-                total_data.get(
-                    "value"
-                )
-            )
-
-        else:
-
-            total = (
-                total_data
-            )
-
-        scroll_id = (
-            data.get(
-                "scrollId"
-            )
-        )
-
-        print(
-            "Reported total:",
-            total,
-        )
-
-        print(
-            "Returned:",
-            len(
-                classes
-            ),
-        )
-
-        print(
-            "Scroll ID present:",
-            bool(
-                scroll_id
-            ),
-        )
-
-        # ====================================================
-        # STEP 6
-        # SIMPLIFY EACH SECTION
-        # ====================================================
-
-        simplified = []
-
-        for item in classes:
-
-            if not isinstance(
-                item,
-                dict,
-            ):
-
-                continue
-
-            clas = (
-                item.get(
-                    "CLAS",
-                    {}
-                )
-            )
-
-            if not isinstance(
-                clas,
-                dict,
-            ):
-
-                continue
-
-            # ------------------------------------------------
-            # SEAT INFORMATION
-            # ------------------------------------------------
-
-            seat_info = (
-                item.get(
-                    "seatInfo",
-                    {}
-                )
-            )
-
-            if not isinstance(
-                seat_info,
-                dict,
-            ):
-
-                seat_info = {}
-
-            enroll_cap = (
-                seat_info.get(
-                    "ENRL_CAP"
-                )
-            )
-
-            enroll_total = (
-                seat_info.get(
-                    "ENRL_TOT"
-                )
-            )
-
-            # Fall back to CLAS fields.
-            if enroll_cap is None:
-
-                enroll_cap = (
-                    clas.get(
-                        "ENRLCAP"
-                    )
-                )
-
-            if enroll_total is None:
-
-                enroll_total = (
-                    clas.get(
-                        "ENRLTOT"
-                    )
-                )
-
-            # ------------------------------------------------
-            # OPEN SEATS
-            # ------------------------------------------------
-
-            open_seats = None
-
-            try:
-
-                if (
-                    enroll_cap is not None
-                    and
-                    enroll_total is not None
-                ):
-
-                    open_seats = (
-                        int(
-                            enroll_cap
-                        )
-                        -
-                        int(
-                            enroll_total
-                        )
-                    )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-
-                open_seats = None
-
-            # ------------------------------------------------
-            # INSTRUCTOR
-            # ------------------------------------------------
-
-            instructor_first = ""
-
-            instructor_last = ""
-
-            first_names = (
-                clas.get(
-                    "INSTRUCTORSFIRSTNAMESHOWALL"
-                )
-                or
-                clas.get(
-                    "INSTRUCTORSFIRSTNAMELIST"
-                )
-                or
-                []
-            )
-
-            last_names = (
-                clas.get(
-                    "INSTRUCTORSLASTNAMESHOWALL"
-                )
-                or
-                clas.get(
-                    "INSTRUCTORSLASTNAMELIST"
-                )
-                or
-                []
-            )
-
-            if first_names:
-
-                instructor_first = str(
-                    first_names[0]
-                ).split(
-                    "~"
-                )[0]
-
-            if last_names:
-
-                instructor_last = str(
-                    last_names[0]
-                ).split(
-                    "~"
-                )[0]
-
-            # ------------------------------------------------
-            # CLASS
-            # ------------------------------------------------
-
-            class_num = str(
-                clas.get(
-                    "CLASSNBR",
-                    ""
-                )
-            ).strip()
-
-            simplified.append({
-
-                "class_num":
-                    class_num,
-
-                "subject":
-                    clas.get(
-                        "SUBJECT"
-                    ),
-
-                "catalog_num":
-                    clas.get(
-                        "CATALOGNBR"
-                    ),
-
-                "section":
-                    clas.get(
-                        "CLASSSECTION"
-                    ),
-
-                "session":
-                    clas.get(
-                        "SESSIONCODE"
-                    ),
-
-                "component":
-                    clas.get(
-                        "SSRCOMPONENT"
-                    ),
-
-                "title":
-                    clas.get(
-                        "TITLE"
-                    ),
-
-                "instructor_last":
-                    instructor_last,
-
-                "instructor_first":
-                    instructor_first,
-
-                "enroll_cap":
-                    enroll_cap,
-
-                "enroll_total":
-                    enroll_total,
-
-                "open_seats":
-                    open_seats,
-            })
-
-        # ====================================================
-        # STEP 7
-        # SUMMARY
-        # ====================================================
-
-        print(
-            "\n========================================"
-        )
-
-        print(
-            f"{subject} {catalog_num} RESULTS"
-        )
-
-        print(
-            "========================================"
-        )
-
-        print(
-            "Sections returned:",
-            len(
-                simplified
-            ),
-        )
-
-        for section in (
-            simplified
-        ):
-
-            print(
-                (
-                    f"{section['class_num']} | "
-                    f"Section "
-                    f"{section['section']} | "
-                    f"{section['component']} | "
-                    f"Cap "
-                    f"{section['enroll_cap']} | "
-                    f"Enrolled "
-                    f"{section['enroll_total']} | "
-                    f"Open "
-                    f"{section['open_seats']}"
-                )
-            )
-
-        # ====================================================
-        # CLOSE
-        # ====================================================
 
         await browser.close()
 
@@ -3086,7 +3055,16 @@ async def diagnose_asu_api(
 
         return {
             "ok":
-                True,
+                (
+                    course_result[
+                        "found"
+                    ]
+                    and
+                    course_result[
+                        "status"
+                    ] ==
+                    200
+                ),
 
             "subject":
                 subject,
@@ -3103,36 +3081,8 @@ async def diagnose_asu_api(
             "term":
                 term,
 
-            "status":
-                status,
-
-            "reported_total":
-                total,
-
-            "returned":
-                len(
-                    simplified
-                ),
-
-            "scroll_required":
-                (
-                    total is not None
-                    and
-                    len(
-                        simplified
-                    ) <
-                    int(
-                        total
-                    )
-                ),
-
-            "scroll_id_present":
-                bool(
-                    scroll_id
-                ),
-
-            "classes":
-                simplified,
+            "course_api":
+                course_result,
 
             "requests":
                 captured_requests,
